@@ -45,8 +45,9 @@ func ruleResource(id, typ string) types.Object {
 	})
 }
 
-func authGroups(group string, users ...string) types.Map {
-	return types.MapValueMust(authGroupsType, map[string]attr.Value{group: strList(users...)})
+// authGroups authorizes users on group g1, the source every SSH fixture uses.
+func authGroups(users ...string) types.Map {
+	return types.MapValueMust(authGroupsType, map[string]attr.Value{"g1": strList(users...)})
 }
 
 // ruleAllNull is a rule whose optional fields are all null, as in a config that
@@ -100,7 +101,7 @@ func Test_adoptUnconfiguredRuleFields(t *testing.T) {
 	sshState := ruleAllNull("netbird-ssh")
 	sshState.Sources = strList("g1")
 	sshState.Destinations = strList("g2")
-	sshState.AuthorizedGroups = authGroups("g1", "root")
+	sshState.AuthorizedGroups = authGroups("root")
 
 	cases := []struct {
 		name   string
@@ -253,7 +254,7 @@ func Test_adoptUnconfiguredRuleFields(t *testing.T) {
 				r.Id = types.StringUnknown()
 				r.Sources = strList("g1")
 				r.Destinations = strList("g2")
-				r.AuthorizedGroups = authGroups("g1", "root")
+				r.AuthorizedGroups = authGroups("root")
 				return r
 			},
 		},
@@ -297,7 +298,10 @@ func Test_adoptUnconfiguredRuleFields(t *testing.T) {
 			},
 		},
 		{
-			name: "authorized groups dropped when the sources are not known yet",
+			// Sources from another resource may resolve to the same IDs.
+			// Dropping the map would lift the SSH user restrictions without a
+			// word; keeping it fails closed if the sources do change.
+			name: "authorized groups kept while the sources are not known yet",
 			plan: func() PolicyRuleModel {
 				r := rulePlanned("netbird-ssh")
 				r.Sources = types.ListUnknown(types.StringType)
@@ -314,6 +318,54 @@ func Test_adoptUnconfiguredRuleFields(t *testing.T) {
 				r.Id = types.StringUnknown()
 				r.Sources = types.ListUnknown(types.StringType)
 				r.Destinations = strList("g2")
+				r.AuthorizedGroups = authGroups("root")
+				return r
+			},
+		},
+		{
+			name: "authorized groups kept while a source ID is not known yet",
+			plan: func() PolicyRuleModel {
+				r := rulePlanned("netbird-ssh")
+				r.Sources = types.ListValueMust(types.StringType, []attr.Value{types.StringUnknown()})
+				return r
+			},
+			config: func() PolicyRuleModel {
+				r := ruleAllNull("netbird-ssh")
+				r.Sources = types.ListValueMust(types.StringType, []attr.Value{types.StringUnknown()})
+				return r
+			},
+			state: sshState,
+			want: func() PolicyRuleModel {
+				r := ruleAllNull("netbird-ssh")
+				r.Id = types.StringUnknown()
+				r.Sources = types.ListValueMust(types.StringType, []attr.Value{types.StringUnknown()})
+				r.Destinations = strList("g2")
+				r.AuthorizedGroups = authGroups("root")
+				return r
+			},
+		},
+		{
+			name: "authorized groups kept while the protocol is not known yet",
+			plan: func() PolicyRuleModel {
+				r := rulePlanned("netbird-ssh")
+				r.Protocol = types.StringUnknown()
+				return r
+			},
+			config: func() PolicyRuleModel {
+				r := ruleAllNull("netbird-ssh")
+				r.Protocol = types.StringUnknown()
+				return r
+			},
+			state: sshState,
+			want: func() PolicyRuleModel {
+				r := ruleAllNull("netbird-ssh")
+				r.Id = types.StringUnknown()
+				r.Protocol = types.StringUnknown()
+				r.Ports = types.ListUnknown(types.StringType)
+				r.PortRanges = types.ListUnknown(portRangeType)
+				r.Sources = strList("g1")
+				r.Destinations = strList("g2")
+				r.AuthorizedGroups = authGroups("root")
 				return r
 			},
 		},

@@ -817,12 +817,18 @@ func adoptUnconfiguredRuleFields(plan, config, state PolicyRuleModel) PolicyRule
 	}
 
 	if unconfigured(plan.AuthorizedGroups, config.AuthorizedGroups) {
-		plan.AuthorizedGroups = types.MapNull(types.ListType{ElemType: types.StringType})
 		// The server requires an entry for every source and this provider
 		// rejects keys that are not sources, so the prior map is only still
 		// valid on a netbird-ssh rule whose sources are exactly its keys.
-		if protocol.Equal(types.StringValue("netbird-ssh")) && keysMatchSources(state.AuthorizedGroups, plan.Sources) {
+		// While either input is unknown the map is kept: dropping it would
+		// lift the SSH user restrictions, where a real mismatch fails closed.
+		switch {
+		case !isKnown(protocol) || !allKnown(plan.Sources):
 			plan.AuthorizedGroups = state.AuthorizedGroups
+		case protocol.ValueString() == "netbird-ssh" && keysMatchSources(state.AuthorizedGroups, plan.Sources):
+			plan.AuthorizedGroups = state.AuthorizedGroups
+		default:
+			plan.AuthorizedGroups = types.MapNull(types.ListType{ElemType: types.StringType})
 		}
 	}
 
@@ -842,6 +848,20 @@ func isKnown(v attr.Value) bool {
 func protocolRejectsPorts(protocol types.String) bool {
 	p := protocol.ValueString()
 	return isKnown(protocol) && (p == "all" || p == "icmp")
+}
+
+// allKnown reports whether a list and every element in it are known. A null
+// list counts as known.
+func allKnown(l types.List) bool {
+	if l.IsUnknown() {
+		return false
+	}
+	for _, v := range l.Elements() {
+		if v.IsUnknown() {
+			return false
+		}
+	}
+	return true
 }
 
 func keysMatchSources(authorizedGroups types.Map, sources types.List) bool {
