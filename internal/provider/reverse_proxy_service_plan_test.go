@@ -511,35 +511,45 @@ func Test_reverseProxyServicePlan_keepsUnconfiguredTargetHostAndPath(t *testing.
 			want: []hostPath{{str("192.168.1.20"), str("/b")}, {str("192.168.1.10"), str("/a")}},
 		},
 		{
-			// Targets sharing a resource cannot be told apart by it, so they
-			// fall back to position, which is how Terraform itself matches
-			// list elements. In place, that is exact.
-			name: "same resource twice",
-			prior: []ReverseProxyServiceTargetModel{
-				targetModel("res-a", "subnet", "192.168.1.10", "/"),
-				targetModel("res-a", "subnet", "192.168.1.10", "/api"),
-			},
-			config: []ReverseProxyServiceTargetModel{
-				targetModel("res-a", "subnet", "", ""),
-				targetModel("res-a", "subnet", "", ""),
-			},
-			want: []hostPath{{str("192.168.1.10"), str("/")}, {str("192.168.1.10"), str("/api")}},
-		},
-		{
-			// Moved, a shared resource keeps a value only where the same
-			// resource still sits at that position.
+			// Targets sharing a resource are told apart by their path, which
+			// configuration must then set.
 			name: "same resource twice, reordered",
 			prior: []ReverseProxyServiceTargetModel{
 				targetModel("res-a", "subnet", "192.168.1.10", "/a"),
-				targetModel("res-a", "subnet", "192.168.1.10", "/b"),
+				targetModel("res-a", "subnet", "192.168.1.20", "/b"),
 				targetModel("res-c", "subnet", "192.168.1.30", "/c"),
 			},
 			config: []ReverseProxyServiceTargetModel{
 				targetModel("res-c", "subnet", "", ""),
+				targetModel("res-a", "subnet", "", "/b"),
+				targetModel("res-a", "subnet", "", "/a"),
+			},
+			want: []hostPath{{str("192.168.1.30"), str("/c")}, {str("192.168.1.20"), str("/b")}, {str("192.168.1.10"), str("/a")}},
+		},
+		{
+			// A new target on a resource another target already uses is new:
+			// it must not inherit that target's host.
+			name:  "adding a target on a shared resource",
+			prior: []ReverseProxyServiceTargetModel{targetModel("res-a", "subnet", "192.168.1.10", "/a")},
+			config: []ReverseProxyServiceTargetModel{
+				targetModel("res-a", "subnet", "", "/new"),
+				targetModel("res-a", "subnet", "", "/a"),
+			},
+			want: []hostPath{{nil, str("/new")}, {str("192.168.1.10"), str("/a")}},
+		},
+		{
+			// Without paths there is nothing to tell them apart by, so nothing
+			// is guessed. ValidateConfig rejects this configuration anyway.
+			name: "shared resource without paths",
+			prior: []ReverseProxyServiceTargetModel{
+				targetModel("res-a", "subnet", "192.168.1.10", "/a"),
+				targetModel("res-a", "subnet", "192.168.1.20", "/b"),
+			},
+			config: []ReverseProxyServiceTargetModel{
 				targetModel("res-a", "subnet", "", ""),
 				targetModel("res-a", "subnet", "", ""),
 			},
-			want: []hostPath{{str("192.168.1.30"), str("/c")}, {str("192.168.1.10"), str("/b")}, {nil, nil}},
+			want: []hostPath{{nil, nil}, {nil, nil}},
 		},
 		{
 			name:  "new target",
@@ -603,5 +613,72 @@ func Test_reverseProxyServicePlan_privateServiceUpdate(t *testing.T) {
 	}
 	if tgt.Options == nil || tgt.Options.DirectUpstream == nil || !*tgt.Options.DirectUpstream {
 		t.Errorf("direct_upstream dropped: %+v", tgt.Options)
+	}
+}
+
+func Test_reverseProxyService_validateConfig_sharedTargets(t *testing.T) {
+	base := configFromState(stateFromAPI(t, privateServiceAPI()))
+
+	cases := []struct {
+		name    string
+		targets []ReverseProxyServiceTargetModel
+		wantErr bool
+	}{
+		{
+			name: "distinct paths",
+			targets: []ReverseProxyServiceTargetModel{
+				targetModel("peer1", "peer", "", "/"),
+				targetModel("peer1", "peer", "", "/api"),
+			},
+		},
+		{
+			name: "one without a path",
+			targets: []ReverseProxyServiceTargetModel{
+				targetModel("peer1", "peer", "", "/api"),
+				targetModel("peer1", "peer", "", ""),
+			},
+			wantErr: true,
+		},
+		{
+			name: "the same path twice",
+			targets: []ReverseProxyServiceTargetModel{
+				targetModel("peer1", "peer", "", "/api"),
+				targetModel("peer1", "peer", "", "/api"),
+			},
+			wantErr: true,
+		},
+		{
+			name: "same ID, different types",
+			targets: []ReverseProxyServiceTargetModel{
+				targetModel("x", "peer", "", ""),
+				targetModel("x", "subnet", "192.168.1.10", ""),
+			},
+		},
+		{
+			name: "path not known yet",
+			targets: []ReverseProxyServiceTargetModel{
+				targetModel("peer1", "peer", "", "/api"),
+				func() ReverseProxyServiceTargetModel {
+					m := targetModel("peer1", "peer", "", "")
+					m.Path = types.StringUnknown()
+					return m
+				}(),
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			errs := validateConfig(t, withTargets(t, base, c.targets...))
+			if !c.wantErr {
+				if len(errs) > 0 {
+					t.Fatalf("unexpected errors: %v", errs)
+				}
+				return
+			}
+			if len(errs) != 1 || !strings.HasPrefix(errs[0], "targets.path: ") {
+				t.Fatalf("want one error on targets.path, got %v", errs)
+			}
+		})
 	}
 }

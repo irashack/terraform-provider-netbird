@@ -1505,3 +1505,87 @@ resource "netbird_reverse_proxy_service" "%s" {
   auth = {}
 }`, rName, rName, domain, peerID)
 }
+
+// Two targets on one peer, told apart by path, each with its own timeout in a
+// non-canonical spelling. Read matched targets on target_id alone, so both
+// took the last one's values and the first planned a change on every run. The
+// empty plan the framework checks after each apply is the assertion here, the
+// second step also reordering the list.
+func Test_ReverseProxyService_SharedTargetPaths(t *testing.T) {
+	cluster := testRequireProxyCluster(t)
+	rName := "s" + acctest.RandStringFromCharSet(8, acctest.CharSetAlpha)
+	domain := rName + "." + cluster.Address
+	rNameFull := "netbird_reverse_proxy_service." + rName
+	peerID := testPeerID(t, "peer1")
+	var createdID string
+
+	root := testSharedTarget(peerID, "/", "60s")
+	apiTarget := testSharedTarget(peerID, "/api", "2m")
+
+	serverTimeouts := func(*terraform.State) error {
+		svc, err := testClient().ReverseProxyServices.Get(context.Background(), createdID)
+		if err != nil {
+			return fmt.Errorf("get service: %w", err)
+		}
+		got := map[string]string{}
+		for _, tgt := range svc.Targets {
+			got[valOr(tgt.Path, "")] = valOr(valOr(tgt.Options, api.ServiceTargetOptions{}).RequestTimeout, "")
+		}
+		return matchPairs(map[string][]any{
+			"/":    {"1m0s", got["/"]},
+			"/api": {"2m0s", got["/api"]},
+		})
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testEnsureManagementRunning(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testCheckGone(testClient().ReverseProxyServices.Get, &createdID),
+		Steps: []resource.TestStep{
+			{
+				Config: testReverseProxyServiceTargets(rName, domain, root, apiTarget),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testRecordID(rNameFull, &createdID),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.options.request_timeout", "60s"),
+					resource.TestCheckResourceAttr(rNameFull, "targets.1.options.request_timeout", "2m"),
+					serverTimeouts,
+				),
+			},
+			{
+				Config: testReverseProxyServiceTargets(rName, domain, apiTarget, root),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.path", "/api"),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.options.request_timeout", "2m"),
+					resource.TestCheckResourceAttr(rNameFull, "targets.1.options.request_timeout", "60s"),
+					serverTimeouts,
+				),
+			},
+		},
+	})
+}
+
+func testSharedTarget(peerID, targetPath, timeout string) string {
+	return fmt.Sprintf(`{
+    target_id   = %q
+    target_type = "peer"
+    port        = 8080
+    protocol    = "http"
+    path        = %q
+
+    options = {
+      request_timeout = %q
+    }
+  }`, peerID, targetPath, timeout)
+}
+
+func testReverseProxyServiceTargets(rName, domain string, targets ...string) string {
+	return fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%s" {
+  name   = %q
+  domain = %q
+
+  targets = [%s]
+
+  auth = {}
+}`, rName, rName, domain, strings.Join(targets, ", "))
+}

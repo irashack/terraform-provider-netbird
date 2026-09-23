@@ -3,7 +3,6 @@ package provider
 import (
 	"context"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
@@ -342,7 +341,7 @@ func (r *ReverseProxyService) Schema(ctx context.Context, req resource.SchemaReq
 							Validators:          []validator.String{stringvalidator.OneOf("http", "https", "tcp", "udp")},
 						},
 						"path": schema.StringAttribute{
-							MarkdownDescription: "URL path prefix for this target. The server routes a target without one as \"/\". If omitted, the value the server holds is kept.",
+							MarkdownDescription: "URL path prefix for this target. The server routes a target without one as \"/\". If omitted, the value the server holds is kept. Targets sharing `target_type` and `target_id` must each set a different path.",
 							Optional:            true,
 							Computed:            true,
 						},
@@ -502,13 +501,57 @@ func (r *ReverseProxyService) Schema(ctx context.Context, req resource.SchemaReq
 	}
 }
 
-// ValidateConfig checks the private-service contract at plan time. Management
-// enforces the same rules, but only once the apply has started, and it would
-// otherwise store access groups on a public service where they do nothing.
+// ValidateConfig catches at plan time what would otherwise fail, or be
+// silently misapplied, during the apply.
 func (r *ReverseProxyService) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	var data ReverseProxyServiceModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
-	if resp.Diagnostics.HasError() || data.Private.IsUnknown() {
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	validateSharedTargets(data.Targets, &resp.Diagnostics)
+	validatePrivateService(&data, &resp.Diagnostics)
+}
+
+// validateSharedTargets requires targets that share a target_type and
+// target_id to set distinct paths. The path is the only thing that tells them
+// apart, both to the proxy and to the provider when it matches a target to its
+// prior state; without it, values the configuration leaves out could be kept
+// from the wrong target.
+func validateSharedTargets(targets types.List, diags *diag.Diagnostics) {
+	if targets.IsNull() || targets.IsUnknown() {
+		return
+	}
+	elems := targets.Elements()
+	counts := countTargetKeys(elems)
+	seen := map[string]bool{}
+	for i, e := range elems {
+		key := targetKey(e)
+		if key == "" || counts[key] < 2 {
+			continue
+		}
+		obj, _ := e.(types.Object)
+		targetPath, _ := obj.Attributes()["path"].(types.String)
+		at := path.Root("targets").AtListIndex(i).AtName("path")
+		switch {
+		case targetPath.IsUnknown():
+		case targetPath.IsNull():
+			diags.AddAttributeError(at, "Missing Attribute Configuration",
+				fmt.Sprintf("Targets sharing target_type and target_id (%s) must each set path, which is what tells them apart.", key))
+		case seen[key+" "+targetPath.ValueString()]:
+			diags.AddAttributeError(at, "Invalid Attribute Combination",
+				fmt.Sprintf("Targets sharing target_type and target_id (%s) must use different paths.", key))
+		default:
+			seen[key+" "+targetPath.ValueString()] = true
+		}
+	}
+}
+
+// validatePrivateService checks the private-service contract. Management
+// enforces the same rules, but only once the apply has started, and it would
+// otherwise store access groups on a public service where they do nothing.
+func validatePrivateService(data *ReverseProxyServiceModel, diags *diag.Diagnostics) {
+	if data.Private.IsUnknown() {
 		return
 	}
 
@@ -517,7 +560,7 @@ func (r *ReverseProxyService) ValidateConfig(ctx context.Context, req resource.V
 	hasGroups := groupsKnown && !data.AccessGroups.IsNull()
 
 	if !private && hasGroups {
-		resp.Diagnostics.AddAttributeError(path.Root("access_groups"), "Invalid Attribute Combination",
+		diags.AddAttributeError(path.Root("access_groups"), "Invalid Attribute Combination",
 			"access_groups applies only to a private service. Set private = true, or remove access_groups.")
 		return
 	}
@@ -526,15 +569,15 @@ func (r *ReverseProxyService) ValidateConfig(ctx context.Context, req resource.V
 	}
 
 	if groupsKnown && len(data.AccessGroups.Elements()) == 0 {
-		resp.Diagnostics.AddAttributeError(path.Root("access_groups"), "Invalid Attribute Combination",
+		diags.AddAttributeError(path.Root("access_groups"), "Invalid Attribute Combination",
 			"A private service needs at least one access group: no peer could reach it otherwise.")
 	}
 	if !data.Mode.IsNull() && !data.Mode.IsUnknown() && data.Mode.ValueString() != "http" {
-		resp.Diagnostics.AddAttributeError(path.Root("mode"), "Invalid Attribute Combination",
+		diags.AddAttributeError(path.Root("mode"), "Invalid Attribute Combination",
 			fmt.Sprintf("A private service must use mode \"http\", not %q.", data.Mode.ValueString()))
 	}
 	if bearerAuthEnabled(data.Auth) {
-		resp.Diagnostics.AddAttributeError(path.Root("auth").AtName("bearer_auth").AtName("enabled"), "Invalid Attribute Combination",
+		diags.AddAttributeError(path.Root("auth").AtName("bearer_auth").AtName("enabled"), "Invalid Attribute Combination",
 			"A private service authenticates peers by their NetBird identity and cannot also enable bearer auth (SSO).")
 	}
 }
@@ -861,9 +904,8 @@ func reverseProxyServiceAPIToTerraform(ctx context.Context, svc *api.Service, da
 // be omitted from the request: the server then resets the path and refuses a
 // cluster or subnet target for having no host.
 //
-// Targets are matched on target_id and target_type, so reordering the list does
-// not move one target's values onto another. Targets sharing a resource cannot
-// be told apart that way and fall back to their position.
+// Targets are matched by matchPriorTarget, so reordering the list does not move
+// one target's values onto another.
 type keepUnconfiguredTargetFields struct{}
 
 func (keepUnconfiguredTargetFields) Description(context.Context) string {
@@ -881,16 +923,7 @@ func (keepUnconfiguredTargetFields) PlanModifyList(ctx context.Context, req plan
 
 	prior := req.StateValue.Elements()
 	planned := req.PlanValue.Elements()
-	priorKeys := make([]string, len(prior))
-	priorCount := map[string]int{}
-	for i, e := range prior {
-		priorKeys[i] = targetKey(e)
-		priorCount[priorKeys[i]]++
-	}
-	plannedCount := map[string]int{}
-	for _, e := range planned {
-		plannedCount[targetKey(e)]++
-	}
+	plannedCount := countTargetKeys(planned)
 
 	changed := false
 	for i, e := range planned {
@@ -906,12 +939,7 @@ func (keepUnconfiguredTargetFields) PlanModifyList(ctx context.Context, req plan
 			continue
 		}
 
-		match := -1
-		if priorCount[key] == 1 && plannedCount[key] == 1 {
-			match = slices.Index(priorKeys, key)
-		} else if i < len(prior) && priorKeys[i] == key {
-			match = i
-		}
+		match := matchPriorTarget(prior, e, plannedCount[key] > 1)
 		if match < 0 {
 			continue
 		}
@@ -939,6 +967,63 @@ func (keepUnconfiguredTargetFields) PlanModifyList(ctx context.Context, req plan
 	list, d := types.ListValue(req.PlanValue.ElementType(ctx), planned)
 	resp.Diagnostics.Append(d...)
 	resp.PlanValue = list
+}
+
+// matchPriorTarget returns the index in prior of the same target as target, or
+// -1. A target is identified by target_type and target_id. Targets sharing both
+// are told apart by path, which ValidateConfig requires them to set; when that
+// does not settle it, no match is guessed. shared reports whether target's list
+// holds another target with the same identity.
+func matchPriorTarget(prior []attr.Value, target attr.Value, shared bool) int {
+	key := targetKey(target)
+	if key == "" {
+		return -1
+	}
+	var candidates []int
+	for j, p := range prior {
+		if targetKey(p) == key {
+			candidates = append(candidates, j)
+		}
+	}
+	if len(candidates) == 1 && !shared {
+		return candidates[0]
+	}
+
+	targetPath, ok := targetAttrString(target, "path")
+	if !ok {
+		return -1
+	}
+	found := -1
+	for _, j := range candidates {
+		priorPath, ok := targetAttrString(prior[j], "path")
+		if !ok || !priorPath.Equal(targetPath) {
+			continue
+		}
+		if found >= 0 {
+			return -1
+		}
+		found = j
+	}
+	return found
+}
+
+func countTargetKeys(targets []attr.Value) map[string]int {
+	counts := map[string]int{}
+	for _, t := range targets {
+		counts[targetKey(t)]++
+	}
+	return counts
+}
+
+// targetAttrString returns a string attribute of a target, and false when it is
+// not known.
+func targetAttrString(target attr.Value, name string) (types.String, bool) {
+	obj, ok := target.(types.Object)
+	if !ok || obj.IsNull() || obj.IsUnknown() {
+		return types.String{}, false
+	}
+	v, ok := obj.Attributes()[name].(types.String)
+	return v, ok && !v.IsUnknown()
 }
 
 // targetKey identifies a target by what it points at, or returns "" when that
@@ -1050,29 +1135,23 @@ func reconcileTargets(ctx context.Context, prior, current types.List) (types.Lis
 		return current, ret
 	}
 
-	priorByID := map[string]types.Object{}
-	for _, e := range prior.Elements() {
-		obj, ok := e.(types.Object)
-		if !ok || obj.IsNull() || obj.IsUnknown() {
-			continue
-		}
-		if id, ok := obj.Attributes()["target_id"].(types.String); ok {
-			priorByID[id.ValueString()] = obj
-		}
-	}
-
+	priorElems := prior.Elements()
 	out := current.Elements()
+	currentCount := countTargetKeys(out)
 	for i, e := range out {
 		cur, ok := e.(types.Object)
 		if !ok || cur.IsNull() || cur.IsUnknown() {
 			continue
 		}
-		attrs := cur.Attributes()
-		id, _ := attrs["target_id"].(types.String)
-		match, ok := priorByID[id.ValueString()]
+		j := matchPriorTarget(priorElems, e, currentCount[targetKey(e)] > 1)
+		if j < 0 {
+			continue
+		}
+		match, ok := priorElems[j].(types.Object)
 		if !ok {
 			continue
 		}
+		attrs := cur.Attributes()
 		priorAttrs := match.Attributes()
 
 		typ, _ := attrs["target_type"].(types.String)

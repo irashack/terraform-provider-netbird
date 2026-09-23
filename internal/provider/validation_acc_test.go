@@ -240,6 +240,30 @@ resource "netbird_reverse_proxy_service" "%[1]s" {
   }
 }`, rName, group),
 		},
+		{
+			// Targets on one peer are told apart only by path.
+			name: "reverse_proxy_service two targets on one peer with one path",
+			config: fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%[1]s" {
+  name   = "%[1]s"
+  domain = "%[1]s.reject.local"
+
+  targets = [{
+    target_id   = "whatever"
+    target_type = "peer"
+    port        = 8080
+    protocol    = "http"
+    path        = "/api"
+  }, {
+    target_id   = "whatever"
+    target_type = "peer"
+    port        = 8081
+    protocol    = "http"
+    path        = "/api"
+  }]
+  auth = {}
+}`, rName),
+		},
 	}
 
 	for _, c := range cases {

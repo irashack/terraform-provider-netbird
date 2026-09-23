@@ -152,3 +152,28 @@ func Test_reconcileTargets_drift(t *testing.T) {
 		})
 	}
 }
+
+// Two targets on one peer, told apart by path. Matching on target_id alone paired
+// both with the last of them, so the first took its neighbour's configured host
+// and duration and planned a change on every run.
+func Test_reconcileTargets_sharedResource(t *testing.T) {
+	timeout := func(v string) types.Object {
+		return optionsObject(t, map[string]attr.Value{"request_timeout": types.StringValue(v)})
+	}
+	prior := targetList(t,
+		withOptions(targetModel("peer1", "peer", "10.0.0.1", "/a"), timeout("60s")),
+		withOptions(targetModel("peer1", "peer", "10.0.0.2", "/b"), timeout("2m")),
+	)
+	reported := targetList(t,
+		withOptions(targetModel("peer1", "peer", "100.64.0.9", "/a"), timeout("1m0s")),
+		withOptions(targetModel("peer1", "peer", "100.64.0.9", "/b"), timeout("2m0s")),
+	)
+
+	got, d := reconcileTargets(context.Background(), prior, reported)
+	if d.HasError() {
+		t.Fatalf("reconcileTargets: %v", d.Errors())
+	}
+	if !got.Equal(prior) {
+		t.Errorf("got  %v\nwant %v", got, prior)
+	}
+}
