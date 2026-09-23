@@ -149,7 +149,7 @@ func (r *Route) Schema(ctx context.Context, req resource.SchemaRequest, resp *re
 				Optional:            true,
 			},
 			"skip_auto_apply": schema.BoolAttribute{
-				MarkdownDescription: "Indicate if this exit node route (0.0.0.0/0) should skip auto-application for client routing",
+				MarkdownDescription: "Indicate if this exit node route (0.0.0.0/0) should skip auto-application for client routing. If omitted, the value on the server is kept.",
 				Optional:            true,
 				Computed:            true,
 				PlanModifiers:       []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},

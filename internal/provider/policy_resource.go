@@ -175,14 +175,14 @@ func (r *Policy) Schema(ctx context.Context, req resource.SchemaRequest, resp *r
 							Validators:          []validator.String{stringvalidator.OneOf("tcp", "udp", "icmp", "all", "netbird-ssh")},
 						},
 						"ports": schema.ListAttribute{
-							MarkdownDescription: "Policy Rule Ports (mutually exclusive with port_ranges)",
+							MarkdownDescription: "Policy Rule Ports (mutually exclusive with port_ranges). If omitted, the value on the server is kept; set `[]` to clear it.",
 							ElementType:         types.StringType,
 							Optional:            true,
 							Computed:            true,
 							Validators:          []validator.List{listvalidator.ConflictsWith(path.MatchRelative().AtParent().AtName("port_ranges")), listvalidator.ValueStringsAre(stringvalidator.RegexMatches(regexp.MustCompile(portStringRegex), "Port outside range 0 to 65535"))},
 						},
 						"port_ranges": schema.ListNestedAttribute{
-							MarkdownDescription: "Policy Rule Port Ranges (mutually exclusive with ports)",
+							MarkdownDescription: "Policy Rule Port Ranges (mutually exclusive with ports). If omitted, the value on the server is kept; set `[]` to clear it.",
 							NestedObject: schema.NestedAttributeObject{
 								Attributes: map[string]schema.Attribute{
 									"start": schema.Int32Attribute{
@@ -212,14 +212,14 @@ func (r *Policy) Schema(ctx context.Context, req resource.SchemaRequest, resp *r
 							Default:             booldefault.StaticBool(true),
 						},
 						"sources": schema.ListAttribute{
-							MarkdownDescription: "Policy Rule Source Groups (mutually exclusive with source_resource)",
+							MarkdownDescription: "Policy Rule Source Groups (mutually exclusive with source_resource). If omitted, the value on the server is kept.",
 							ElementType:         types.StringType,
 							Optional:            true,
 							Computed:            true,
 							Validators:          []validator.List{listvalidator.ConflictsWith(path.MatchRelative().AtParent().AtName("source_resource")), listvalidator.ValueStringsAre(stringvalidator.LengthAtLeast(1))},
 						},
 						"source_resource": schema.ObjectAttribute{
-							MarkdownDescription: "Policy Rule Source Resource (mutually exclusive with sources)",
+							MarkdownDescription: "Policy Rule Source Resource (mutually exclusive with sources). If omitted, the value on the server is kept.",
 							AttributeTypes: map[string]attr.Type{
 								"id":   types.StringType,
 								"type": types.StringType,
@@ -229,14 +229,14 @@ func (r *Policy) Schema(ctx context.Context, req resource.SchemaRequest, resp *r
 							Validators: []validator.Object{objectvalidator.ConflictsWith(path.MatchRelative().AtParent().AtName("sources"))},
 						},
 						"destinations": schema.ListAttribute{
-							MarkdownDescription: "Policy Rule Destination Groups (mutually exclusive with destination_resource)",
+							MarkdownDescription: "Policy Rule Destination Groups (mutually exclusive with destination_resource). If omitted, the value on the server is kept.",
 							ElementType:         types.StringType,
 							Optional:            true,
 							Computed:            true,
 							Validators:          []validator.List{listvalidator.ConflictsWith(path.MatchRelative().AtParent().AtName("destination_resource")), listvalidator.ValueStringsAre(stringvalidator.LengthAtLeast(1))},
 						},
 						"destination_resource": schema.ObjectAttribute{
-							MarkdownDescription: "Policy Rule Destination Resource (mutually exclusive with destinations)",
+							MarkdownDescription: "Policy Rule Destination Resource (mutually exclusive with destinations). If omitted, the value on the server is kept.",
 							AttributeTypes: map[string]attr.Type{
 								"id":   types.StringType,
 								"type": types.StringType,
@@ -246,7 +246,7 @@ func (r *Policy) Schema(ctx context.Context, req resource.SchemaRequest, resp *r
 							Validators: []validator.Object{objectvalidator.ConflictsWith(path.MatchRelative().AtParent().AtName("destinations"))},
 						},
 						"authorized_groups": schema.MapAttribute{
-							MarkdownDescription: "Map of source group IDs to a list of local users authorized for SSH access. Keys must be group IDs present in `sources`. If not set, all local users are permitted. Only applicable when protocol is `netbird-ssh`.",
+							MarkdownDescription: "Map of source group IDs to a list of local users authorized for SSH access. Keys must be group IDs present in `sources`. Only applicable when protocol is `netbird-ssh`. If omitted, the value on the server is kept; set `{}` to clear it, which permits all local users.",
 							ElementType:         types.ListType{ElemType: types.StringType},
 							Optional:            true,
 							Computed:            true,
@@ -281,7 +281,7 @@ func (r *Policy) Schema(ctx context.Context, req resource.SchemaRequest, resp *r
 				PlanModifiers:       []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
 			},
 			"source_posture_checks": schema.ListAttribute{
-				MarkdownDescription: "Posture checks associated with policy",
+				MarkdownDescription: "Posture checks associated with policy. If omitted, the value on the server is kept; set `[]` to clear it.",
 				ElementType:         types.StringType,
 				Optional:            true,
 				Computed:            true,

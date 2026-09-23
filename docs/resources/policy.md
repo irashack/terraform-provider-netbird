@@ -64,7 +64,7 @@ resource "netbird_policy" "ssh_example" {
 - `description` (String) Policy Description
 - `enabled` (Boolean) Policy enabled
 - `rule` (Block List) (see [below for nested schema](#nestedblock--rule))
-- `source_posture_checks` (List of String) Posture checks associated with policy
+- `source_posture_checks` (List of String) Posture checks associated with policy. If omitted, the value on the server is kept; set `[]` to clear it.
 
 ### Read-Only
 
@@ -80,17 +80,17 @@ Required:
 Optional:
 
 - `action` (String) Policy Rule Action (accept|drop)
-- `authorized_groups` (Map of List of String) Map of source group IDs to a list of local users authorized for SSH access. Keys must be group IDs present in `sources`. If not set, all local users are permitted. Only applicable when protocol is `netbird-ssh`.
+- `authorized_groups` (Map of List of String) Map of source group IDs to a list of local users authorized for SSH access. Keys must be group IDs present in `sources`. Only applicable when protocol is `netbird-ssh`. If omitted, the value on the server is kept; set `{}` to clear it, which permits all local users.
 - `bidirectional` (Boolean) Policy Rule Bidirectional
 - `description` (String) Policy description
-- `destination_resource` (Object) Policy Rule Destination Resource (mutually exclusive with destinations) (see [below for nested schema](#nestedatt--rule--destination_resource))
-- `destinations` (List of String) Policy Rule Destination Groups (mutually exclusive with destination_resource)
+- `destination_resource` (Object) Policy Rule Destination Resource (mutually exclusive with destinations). If omitted, the value on the server is kept. (see [below for nested schema](#nestedatt--rule--destination_resource))
+- `destinations` (List of String) Policy Rule Destination Groups (mutually exclusive with destination_resource). If omitted, the value on the server is kept.
 - `enabled` (Boolean) Policy Rule Enabled
-- `port_ranges` (Attributes List) Policy Rule Port Ranges (mutually exclusive with ports) (see [below for nested schema](#nestedatt--rule--port_ranges))
-- `ports` (List of String) Policy Rule Ports (mutually exclusive with port_ranges)
+- `port_ranges` (Attributes List) Policy Rule Port Ranges (mutually exclusive with ports). If omitted, the value on the server is kept; set `[]` to clear it. (see [below for nested schema](#nestedatt--rule--port_ranges))
+- `ports` (List of String) Policy Rule Ports (mutually exclusive with port_ranges). If omitted, the value on the server is kept; set `[]` to clear it.
 - `protocol` (String) Policy Rule Protocol (tcp|udp|icmp|all|netbird-ssh)
-- `source_resource` (Object) Policy Rule Source Resource (mutually exclusive with sources) (see [below for nested schema](#nestedatt--rule--source_resource))
-- `sources` (List of String) Policy Rule Source Groups (mutually exclusive with source_resource)
+- `source_resource` (Object) Policy Rule Source Resource (mutually exclusive with sources). If omitted, the value on the server is kept. (see [below for nested schema](#nestedatt--rule--source_resource))
+- `sources` (List of String) Policy Rule Source Groups (mutually exclusive with source_resource). If omitted, the value on the server is kept.
 
 Read-Only:
 
