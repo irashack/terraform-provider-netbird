@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -352,8 +353,9 @@ func (r *ReverseProxyService) Schema(ctx context.Context, req resource.SchemaReq
 							Default:             booldefault.StaticBool(true),
 						},
 						"options": schema.SingleNestedAttribute{
-							MarkdownDescription: "Per-target options",
+							MarkdownDescription: "Per-target options. If omitted, the options the server holds are kept; set `options = {}` to remove them.",
 							Optional:            true,
+							Computed:            true,
 							Attributes: map[string]schema.Attribute{
 								"skip_tls_verify": schema.BoolAttribute{
 									MarkdownDescription: "Skip TLS certificate verification for this backend (HTTPS targets only)",
@@ -467,8 +469,12 @@ func (r *ReverseProxyService) Schema(ctx context.Context, req resource.SchemaReq
 				},
 			},
 			"access_restrictions": schema.SingleNestedAttribute{
-				MarkdownDescription: "Connection-level access restrictions based on IP or geography",
+				MarkdownDescription: "Connection-level access restrictions based on IP or geography. If omitted, the restrictions the server holds are kept; set `access_restrictions = {}` to remove them.",
 				Optional:            true,
+				Computed:            true,
+				// The PUT replaces the whole service, so an unknown here would be
+				// omitted from the request and remove the restrictions.
+				PlanModifiers: []planmodifier.Object{objectplanmodifier.UseStateForUnknown()},
 				Attributes: map[string]schema.Attribute{
 					"allowed_cidrs": schema.ListAttribute{
 						MarkdownDescription: "CIDR allowlist",
@@ -898,18 +904,22 @@ func reverseProxyServiceAPIToTerraform(ctx context.Context, svc *api.Service, da
 	return ret
 }
 
-// keepUnconfiguredTargetFields plans a target's host and path, when the
+// unconfiguredTargetFields are the Optional and Computed target attributes
+// that keepUnconfiguredTargetFields fills from prior state.
+var unconfiguredTargetFields = []string{"host", "path", "options"}
+
+// keepUnconfiguredTargetFields plans a target's host, path and options, when the
 // configuration leaves them out, as the values the server holds for that target
 // instead of as unknown. The PUT replaces the whole service, so an unknown would
-// be omitted from the request: the server then resets the path and refuses a
-// cluster or subnet target for having no host.
+// be omitted from the request: the server then resets the path and options, and
+// refuses a cluster or subnet target for having no host.
 //
 // Targets are matched by matchPriorTarget, so reordering the list does not move
 // one target's values onto another.
 type keepUnconfiguredTargetFields struct{}
 
 func (keepUnconfiguredTargetFields) Description(context.Context) string {
-	return "Keeps the server's host and path for targets that do not configure them."
+	return "Keeps the server's host, path and options for targets that do not configure them."
 }
 
 func (m keepUnconfiguredTargetFields) MarkdownDescription(ctx context.Context) string {
@@ -933,9 +943,13 @@ func (keepUnconfiguredTargetFields) PlanModifyList(ctx context.Context, req plan
 			continue
 		}
 		attrs := obj.Attributes()
-		host, _ := attrs["host"].(types.String)
-		targetPath, _ := attrs["path"].(types.String)
-		if !host.IsUnknown() && !targetPath.IsUnknown() {
+		var unknown []string
+		for _, name := range unconfiguredTargetFields {
+			if attrs[name].IsUnknown() {
+				unknown = append(unknown, name)
+			}
+		}
+		if len(unknown) == 0 {
 			continue
 		}
 
@@ -949,11 +963,8 @@ func (keepUnconfiguredTargetFields) PlanModifyList(ctx context.Context, req plan
 			continue
 		}
 		priorAttrs := priorObj.Attributes()
-		if host.IsUnknown() {
-			attrs["host"] = priorAttrs["host"]
-		}
-		if targetPath.IsUnknown() {
-			attrs["path"] = priorAttrs["path"]
+		for _, name := range unknown {
+			attrs[name] = priorAttrs[name]
 		}
 		kept, d := types.ObjectValue(obj.AttributeTypes(ctx), attrs)
 		resp.Diagnostics.Append(d...)
@@ -1446,6 +1457,7 @@ func (r *ReverseProxyService) Create(ctx context.Context, req resource.CreateReq
 
 	// Save plan values to preserve fields the API may override
 	planAuth := data.Auth
+	planRestrictions := data.AccessRestrictions
 	planTargets := data.Targets
 
 	resp.Diagnostics.Append(reverseProxyServiceAPIToTerraform(ctx, svc, &data)...)
@@ -1459,6 +1471,7 @@ func (r *ReverseProxyService) Create(ctx context.Context, req resource.CreateReq
 		return
 	}
 	data.Auth = auth
+	data.AccessRestrictions = reconcileObject(ctx, planRestrictions, data.AccessRestrictions)
 
 	targets, targetDiags := reconcileTargets(ctx, planTargets, data.Targets)
 	resp.Diagnostics.Append(targetDiags...)
@@ -1481,6 +1494,7 @@ func (r *ReverseProxyService) Read(ctx context.Context, req resource.ReadRequest
 
 	// Save prior state to preserve fields the API may override
 	priorAuth := data.Auth
+	priorRestrictions := data.AccessRestrictions
 	priorTargets := data.Targets
 
 	svc, err := r.client.ReverseProxyServices.Get(ctx, data.Id.ValueString())
@@ -1504,6 +1518,7 @@ func (r *ReverseProxyService) Read(ctx context.Context, req resource.ReadRequest
 		return
 	}
 	data.Auth = auth
+	data.AccessRestrictions = reconcileObject(ctx, priorRestrictions, data.AccessRestrictions)
 
 	targets, targetDiags := reconcileTargets(ctx, priorTargets, data.Targets)
 	resp.Diagnostics.Append(targetDiags...)
@@ -1538,6 +1553,7 @@ func (r *ReverseProxyService) Update(ctx context.Context, req resource.UpdateReq
 
 	// Save plan values to preserve fields the API may override
 	planAuth := data.Auth
+	planRestrictions := data.AccessRestrictions
 	planTargets := data.Targets
 
 	resp.Diagnostics.Append(reverseProxyServiceAPIToTerraform(ctx, svc, &data)...)
@@ -1551,6 +1567,7 @@ func (r *ReverseProxyService) Update(ctx context.Context, req resource.UpdateReq
 		return
 	}
 	data.Auth = auth
+	data.AccessRestrictions = reconcileObject(ctx, planRestrictions, data.AccessRestrictions)
 
 	targets, targetDiags := reconcileTargets(ctx, planTargets, data.Targets)
 	resp.Diagnostics.Append(targetDiags...)

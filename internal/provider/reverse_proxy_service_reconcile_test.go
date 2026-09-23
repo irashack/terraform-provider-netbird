@@ -177,3 +177,27 @@ func Test_reconcileTargets_sharedResource(t *testing.T) {
 		t.Errorf("got  %v\nwant %v", got, prior)
 	}
 }
+
+// An empty block is how configuration removes every option or restriction. The
+// server then reports nothing at all, which must read back as the empty block
+// rather than as a change.
+func Test_reconcileObject_emptyBlock(t *testing.T) {
+	ctx := context.Background()
+	emptyOpts := optionsObject(t, nil)
+	if got := reconcileObject(ctx, emptyOpts, types.ObjectNull(emptyOpts.AttributeTypes(ctx))); !got.Equal(emptyOpts) {
+		t.Errorf("options: got %v, want the empty block", got)
+	}
+
+	arTypes := ReverseProxyAccessRestrictionsModel{}.TFType().AttrTypes
+	emptyList := types.ListValueMust(types.StringType, nil)
+	emptyAR := types.ObjectValueMust(arTypes, map[string]attr.Value{
+		"allowed_cidrs":     emptyList,
+		"blocked_cidrs":     types.ListNull(types.StringType),
+		"allowed_countries": types.ListNull(types.StringType),
+		"blocked_countries": types.ListNull(types.StringType),
+		"crowdsec_mode":     types.StringNull(),
+	})
+	if got := reconcileObject(ctx, emptyAR, types.ObjectNull(arTypes)); !got.Equal(emptyAR) {
+		t.Errorf("access_restrictions: got %v, want the empty block", got)
+	}
+}

@@ -6,8 +6,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
@@ -105,6 +107,10 @@ func proposedNewState(t *testing.T, config, prior ReverseProxyServiceModel) Reve
 	if d := prior.Targets.ElementsAs(ctx, &priorTargets, false); d.HasError() {
 		t.Fatalf("reading prior targets: %v", d.Errors())
 	}
+	restrictionsComputed, optionsComputed := computedBlocks()
+	if restrictionsComputed && p.AccessRestrictions.IsNull() {
+		p.AccessRestrictions = prior.AccessRestrictions
+	}
 	for i := range cfgTargets {
 		if i >= len(priorTargets) {
 			break
@@ -115,6 +121,9 @@ func proposedNewState(t *testing.T, config, prior ReverseProxyServiceModel) Reve
 		if cfgTargets[i].Path.IsNull() {
 			cfgTargets[i].Path = priorTargets[i].Path
 		}
+		if optionsComputed && cfgTargets[i].Options.IsNull() {
+			cfgTargets[i].Options = priorTargets[i].Options
+		}
 	}
 	list, d := types.ListValueFrom(ctx, ReverseProxyServiceTargetModel{}.TFType(), cfgTargets)
 	if d.HasError() {
@@ -122,6 +131,19 @@ func proposedNewState(t *testing.T, config, prior ReverseProxyServiceModel) Reve
 	}
 	p.Targets = list
 	return p
+}
+
+// computedBlocks reports whether access_restrictions and target options are
+// computed, which decides whether core proposes their prior value when the
+// configuration leaves them out.
+func computedBlocks() (restrictions, options bool) {
+	var sr resource.SchemaResponse
+	(&ReverseProxyService{}).Schema(context.Background(), resource.SchemaRequest{}, &sr)
+	restrictions = sr.Schema.Attributes["access_restrictions"].IsComputed()
+	if targets, ok := sr.Schema.Attributes["targets"].(schema.ListNestedAttribute); ok {
+		options = targets.NestedObject.Attributes["options"].IsComputed()
+	}
+	return restrictions, options
 }
 
 func reverseProxyServiceProtocol(t *testing.T) (tfprotov6.ProviderServer, tfsdk.State) {
@@ -681,4 +703,77 @@ func Test_reverseProxyService_validateConfig_sharedTargets(t *testing.T) {
 			}
 		})
 	}
+}
+
+// withRestrictions sets access_restrictions from the given attributes, the rest
+// null.
+func withRestrictions(t *testing.T, m ReverseProxyServiceModel, set map[string]attr.Value) ReverseProxyServiceModel {
+	t.Helper()
+	list := types.ListNull(types.StringType)
+	attrs := map[string]attr.Value{
+		"allowed_cidrs":     list,
+		"blocked_cidrs":     list,
+		"allowed_countries": list,
+		"blocked_countries": list,
+		"crowdsec_mode":     types.StringNull(),
+	}
+	for k, v := range set {
+		attrs[k] = v
+	}
+	obj, d := types.ObjectValue(ReverseProxyAccessRestrictionsModel{}.TFType().AttrTypes, attrs)
+	if d.HasError() {
+		t.Fatalf("building access_restrictions: %v", d.Errors())
+	}
+	m.AccessRestrictions = obj
+	return m
+}
+
+// Target options and access restrictions left out of the configuration used
+// to plan as null, and the PUT that replaces the whole service then removed
+// them. Left out now means keep; an empty block removes them.
+func Test_reverseProxyServicePlan_keepsUnconfiguredOptionsAndRestrictions(t *testing.T) {
+	prior := withRestrictions(t, stateFromAPI(t, privateServiceAPI()), map[string]attr.Value{
+		"allowed_countries": types.ListValueMust(types.StringType, []attr.Value{types.StringValue("DE")}),
+		"crowdsec_mode":     types.StringValue("observe"),
+	})
+
+	t.Run("left out", func(t *testing.T) {
+		config := configFromState(prior)
+		config.PassHostHeader = types.BoolValue(false)
+		config.AccessRestrictions = types.ObjectNull(ReverseProxyAccessRestrictionsModel{}.TFType().AttrTypes)
+		var targets []ReverseProxyServiceTargetModel
+		if d := config.Targets.ElementsAs(context.Background(), &targets, false); d.HasError() {
+			t.Fatalf("reading targets: %v", d.Errors())
+		}
+		targets[0].Options = types.ObjectNull(ReverseProxyTargetOptionsModel{}.TFType().AttrTypes)
+		config = withTargets(t, config, targets...)
+
+		req := planUpdateRequest(t, prior, config)
+		opts := (*req.Targets)[0].Options
+		if opts == nil || !isTrue(opts.DirectUpstream) || opts.PathRewrite == nil {
+			t.Errorf("target options dropped: %+v", opts)
+		}
+		ar := req.AccessRestrictions
+		if ar == nil || ar.AllowedCountries == nil || len(*ar.AllowedCountries) != 1 || ar.CrowdsecMode == nil {
+			t.Errorf("access_restrictions dropped: %+v", ar)
+		}
+	})
+
+	t.Run("emptied", func(t *testing.T) {
+		config := withRestrictions(t, configFromState(prior), nil)
+		var targets []ReverseProxyServiceTargetModel
+		if d := config.Targets.ElementsAs(context.Background(), &targets, false); d.HasError() {
+			t.Fatalf("reading targets: %v", d.Errors())
+		}
+		targets[0].Options = optionsObject(t, nil)
+		config = withTargets(t, config, targets...)
+
+		req := planUpdateRequest(t, prior, config)
+		if opts := (*req.Targets)[0].Options; opts != nil {
+			t.Errorf("target options = %+v, want none", opts)
+		}
+		if req.AccessRestrictions != nil {
+			t.Errorf("access_restrictions = %+v, want none", req.AccessRestrictions)
+		}
+	})
 }

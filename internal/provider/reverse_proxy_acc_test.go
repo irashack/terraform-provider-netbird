@@ -1589,3 +1589,93 @@ resource "netbird_reverse_proxy_service" "%s" {
   auth = {}
 }`, rName, rName, domain, strings.Join(targets, ", "))
 }
+
+// Target options and access restrictions that the configuration leaves out
+// used to be omitted from the update, and the PUT that replaces the service
+// removed them. Leaving them out now keeps them; an empty block removes them,
+// and the empty plan checked after that apply shows the empty block is stable
+// although the server then reports nothing.
+func Test_ReverseProxyService_KeepsUnconfiguredOptionsAndRestrictions(t *testing.T) {
+	cluster := testRequireProxyCluster(t)
+	rName := "s" + acctest.RandStringFromCharSet(8, acctest.CharSetAlpha)
+	domain := rName + "." + cluster.Address
+	rNameFull := "netbird_reverse_proxy_service." + rName
+	peerID := testPeerID(t, "peer1")
+	var createdID string
+
+	config := func(passHostHeader bool, options, restrictions string) string {
+		return fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%s" {
+  name             = %q
+  domain           = %q
+  pass_host_header = %t
+
+  targets = [{
+    target_id   = %q
+    target_type = "peer"
+    port        = 8080
+    protocol    = "http"
+    path        = "/"
+%s
+  }]
+
+  auth = {}
+%s
+}`, rName, rName, domain, passHostHeader, peerID, options, restrictions)
+	}
+	withBlocks := config(false, `    options = {
+      path_rewrite = "preserve"
+    }`, `  access_restrictions = {
+    allowed_countries = ["DE"]
+  }`)
+
+	server := func(wantBlocks bool) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			svc, err := testClient().ReverseProxyServices.Get(context.Background(), createdID)
+			if err != nil {
+				return fmt.Errorf("get service: %w", err)
+			}
+			opts := valOr(svc.Targets[0].Options, api.ServiceTargetOptions{})
+			hasOpts := opts.PathRewrite != nil
+			hasRestrictions := svc.AccessRestrictions != nil && svc.AccessRestrictions.AllowedCountries != nil
+			return matchPairs(map[string][]any{
+				"Target.Options.PathRewrite":          {wantBlocks, hasOpts},
+				"AccessRestrictions.AllowedCountries": {wantBlocks, hasRestrictions},
+			})
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testEnsureManagementRunning(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testCheckGone(testClient().ReverseProxyServices.Get, &createdID),
+		Steps: []resource.TestStep{
+			{
+				Config: withBlocks,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testRecordID(rNameFull, &createdID),
+					server(true),
+				),
+			},
+			{
+				Config:           config(true, "", ""),
+				ConfigPlanChecks: updatesInPlace(rNameFull),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.options.path_rewrite", "preserve"),
+					resource.TestCheckResourceAttr(rNameFull, "access_restrictions.allowed_countries.0", "DE"),
+					server(true),
+				),
+			},
+			{
+				ResourceName:      rNameFull,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				Config:           config(true, "    options = {}", "  access_restrictions = {}"),
+				ConfigPlanChecks: updatesInPlace(rNameFull),
+				Check:            server(false),
+			},
+		},
+	})
+}

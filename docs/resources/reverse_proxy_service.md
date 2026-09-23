@@ -155,7 +155,7 @@ resource "netbird_reverse_proxy_service" "tls_backend" {
 ### Optional
 
 - `access_groups` (List of String) IDs of the groups whose peers may reach a private service over the tunnel. Required when `private` is true, and allowed only then.
-- `access_restrictions` (Attributes) Connection-level access restrictions based on IP or geography (see [below for nested schema](#nestedatt--access_restrictions))
+- `access_restrictions` (Attributes) Connection-level access restrictions based on IP or geography. If omitted, the restrictions the server holds are kept; set `access_restrictions = {}` to remove them. (see [below for nested schema](#nestedatt--access_restrictions))
 - `enabled` (Boolean) Whether the service is enabled
 - `listen_port` (Number) Port the proxy listens on (L4/TLS only). Set to 0 for auto-assignment.
 - `mode` (String) Service mode: "http" for L7 reverse proxy, "tcp"/"udp"/"tls" for L4 passthrough
@@ -249,7 +249,7 @@ Optional:
 
 - `enabled` (Boolean) Whether this target is enabled
 - `host` (String) Backend IP or domain for this target. If omitted when the target is created, the API resolves it from the target peer or resource; if omitted afterwards, the value the server holds is kept.
-- `options` (Attributes) Per-target options (see [below for nested schema](#nestedatt--targets--options))
+- `options` (Attributes) Per-target options. If omitted, the options the server holds are kept; set `options = {}` to remove them. (see [below for nested schema](#nestedatt--targets--options))
 - `path` (String) URL path prefix for this target. The server routes a target without one as "/". If omitted, the value the server holds is kept. Targets sharing `target_type` and `target_id` must each set a different path.
 
 <a id="nestedatt--targets--options"></a>
