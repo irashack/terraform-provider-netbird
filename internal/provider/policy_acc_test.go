@@ -465,7 +465,8 @@ func Test_Policy_Update_KeepsUnconfiguredAuthorizedGroups(t *testing.T) {
 // HCL passed in, so a step can drop or clear them.
 func testPolicyResourceWith(rName, description, action, policyHCL, ruleHCL string) string {
 	return fmt.Sprintf(`resource "netbird_posture_check" "%[1]s" {
-	name = "%[1]s"
+	name        = "%[1]s"
+	description = "fixture for %[1]s"
 
 	netbird_version_check {
 		min_version = "0.40.0"
