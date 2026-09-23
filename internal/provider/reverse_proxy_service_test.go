@@ -940,7 +940,7 @@ func Test_preserveAuthSecrets_nullPrior(t *testing.T) {
 	}
 }
 
-func Test_preserveTargetPlanValues(t *testing.T) {
+func Test_reconcileTargets(t *testing.T) {
 	ctx := context.Background()
 
 	planModels := []ReverseProxyServiceTargetModel{
@@ -977,9 +977,9 @@ func Test_preserveTargetPlanValues(t *testing.T) {
 		t.Fatal("Failed to build API targets")
 	}
 
-	result, d := preserveTargetPlanValues(ctx, planTargets, apiTargets)
+	result, d := reconcileTargets(ctx, planTargets, apiTargets)
 	if d.HasError() {
-		t.Fatalf("preserveTargetPlanValues failed with %d errors", d.ErrorsCount())
+		t.Fatalf("reconcileTargets failed with %d errors", d.ErrorsCount())
 	}
 
 	var resultModels []ReverseProxyServiceTargetModel
@@ -994,15 +994,17 @@ func Test_preserveTargetPlanValues(t *testing.T) {
 	if resultModels[0].Host.ValueString() != "10.0.0.1" {
 		t.Errorf("Expected host to be preserved as '10.0.0.1', got %q", resultModels[0].Host.ValueString())
 	}
-	if resultModels[0].Path.ValueString() != "/custom" {
-		t.Errorf("Expected path to be preserved as '/custom', got %q", resultModels[0].Path.ValueString())
+	// The server stores the path as sent, so a different one is a change made
+	// outside Terraform and has to show up as drift.
+	if resultModels[0].Path.ValueString() != "/" {
+		t.Errorf("Expected the API path '/', got %q", resultModels[0].Path.ValueString())
 	}
 	if resultModels[0].Port.ValueInt64() != 8080 {
 		t.Errorf("Expected port 8080, got %d", resultModels[0].Port.ValueInt64())
 	}
 }
 
-func Test_preserveTargetPlanValues_nullPlanHost(t *testing.T) {
+func Test_reconcileTargets_nullPlanHost(t *testing.T) {
 	ctx := context.Background()
 
 	planModels := []ReverseProxyServiceTargetModel{
@@ -1039,9 +1041,9 @@ func Test_preserveTargetPlanValues_nullPlanHost(t *testing.T) {
 		t.Fatal("Failed to build API targets")
 	}
 
-	result, d := preserveTargetPlanValues(ctx, planTargets, apiTargets)
+	result, d := reconcileTargets(ctx, planTargets, apiTargets)
 	if d.HasError() {
-		t.Fatalf("preserveTargetPlanValues failed with %d errors", d.ErrorsCount())
+		t.Fatalf("reconcileTargets failed with %d errors", d.ErrorsCount())
 	}
 
 	var resultModels []ReverseProxyServiceTargetModel
@@ -1058,7 +1060,7 @@ func Test_preserveTargetPlanValues_nullPlanHost(t *testing.T) {
 	}
 }
 
-func Test_preserveTargetPlanValues_extraAPITarget(t *testing.T) {
+func Test_reconcileTargets_extraAPITarget(t *testing.T) {
 	ctx := context.Background()
 
 	planModels := []ReverseProxyServiceTargetModel{
@@ -1105,9 +1107,9 @@ func Test_preserveTargetPlanValues_extraAPITarget(t *testing.T) {
 		t.Fatal("Failed to build API targets")
 	}
 
-	result, d := preserveTargetPlanValues(ctx, planTargets, apiTargets)
+	result, d := reconcileTargets(ctx, planTargets, apiTargets)
 	if d.HasError() {
-		t.Fatalf("preserveTargetPlanValues failed with %d errors", d.ErrorsCount())
+		t.Fatalf("reconcileTargets failed with %d errors", d.ErrorsCount())
 	}
 
 	var resultModels []ReverseProxyServiceTargetModel
@@ -1127,7 +1129,7 @@ func Test_preserveTargetPlanValues_extraAPITarget(t *testing.T) {
 	}
 }
 
-func Test_preserveTargetPlanValues_nullPlan(t *testing.T) {
+func Test_reconcileTargets_nullPlan(t *testing.T) {
 	ctx := context.Background()
 
 	apiModels := []ReverseProxyServiceTargetModel{
@@ -1147,9 +1149,9 @@ func Test_preserveTargetPlanValues_nullPlan(t *testing.T) {
 		t.Fatal("Failed to build API targets")
 	}
 
-	result, d := preserveTargetPlanValues(ctx, types.ListNull(ReverseProxyServiceTargetModel{}.TFType()), apiTargets)
+	result, d := reconcileTargets(ctx, types.ListNull(ReverseProxyServiceTargetModel{}.TFType()), apiTargets)
 	if d.HasError() {
-		t.Fatalf("preserveTargetPlanValues failed with %d errors", d.ErrorsCount())
+		t.Fatalf("reconcileTargets failed with %d errors", d.ErrorsCount())
 	}
 
 	var resultModels []ReverseProxyServiceTargetModel

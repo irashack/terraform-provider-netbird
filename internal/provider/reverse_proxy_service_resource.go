@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
@@ -1029,47 +1030,145 @@ func preserveAuthSecrets(priorAuth, currentAuth types.Object) (types.Object, dia
 	return result, ret
 }
 
-// preserveTargetPlanValues keeps the user's planned host/path/options values in targets
-// since the API may override them (e.g. resolving host from the peer's IP).
-// Targets are matched by target_id to handle potential reordering by the API.
-func preserveTargetPlanValues(ctx context.Context, planTargets, apiTargets types.List) (types.List, diag.Diagnostics) {
+// derivedHostTargets are the target types whose host management resolves from
+// the peer or network resource on every read, whatever the request carried.
+var derivedHostTargets = map[string]bool{"peer": true, "host": true, "domain": true}
+
+// durationOptions are the target options management parses as durations and
+// reports back in canonical form ("60s" as "1m0s").
+var durationOptions = map[string]bool{"request_timeout": true, "session_idle_timeout": true}
+
+// reconcileTargets returns the targets the API reported, keeping a prior value
+// only where the API reports the same setting differently: a host the server
+// derives for peer, host and domain targets, and options it omits when false or
+// writes back in canonical form. Everything else follows the API, so a change
+// made outside Terraform shows up as drift. prior is the plan on create and
+// update and the prior state on read.
+func reconcileTargets(ctx context.Context, prior, current types.List) (types.List, diag.Diagnostics) {
 	var ret diag.Diagnostics
-
-	if planTargets.IsNull() || planTargets.IsUnknown() || apiTargets.IsNull() || apiTargets.IsUnknown() {
-		return apiTargets, ret
+	if prior.IsNull() || prior.IsUnknown() || current.IsNull() || current.IsUnknown() {
+		return current, ret
 	}
 
-	var planModels, apiModels []ReverseProxyServiceTargetModel
-	ret.Append(planTargets.ElementsAs(ctx, &planModels, false)...)
-	ret.Append(apiTargets.ElementsAs(ctx, &apiModels, false)...)
-	if ret.HasError() {
-		return apiTargets, ret
+	priorByID := map[string]types.Object{}
+	for _, e := range prior.Elements() {
+		obj, ok := e.(types.Object)
+		if !ok || obj.IsNull() || obj.IsUnknown() {
+			continue
+		}
+		if id, ok := obj.Attributes()["target_id"].(types.String); ok {
+			priorByID[id.ValueString()] = obj
+		}
 	}
 
-	planByID := make(map[string]ReverseProxyServiceTargetModel, len(planModels))
-	for _, p := range planModels {
-		planByID[p.TargetId.ValueString()] = p
-	}
-
-	for i, apiModel := range apiModels {
-		planModel, ok := planByID[apiModel.TargetId.ValueString()]
+	out := current.Elements()
+	for i, e := range out {
+		cur, ok := e.(types.Object)
+		if !ok || cur.IsNull() || cur.IsUnknown() {
+			continue
+		}
+		attrs := cur.Attributes()
+		id, _ := attrs["target_id"].(types.String)
+		match, ok := priorByID[id.ValueString()]
 		if !ok {
 			continue
 		}
-		if !planModel.Host.IsNull() && !planModel.Host.IsUnknown() {
-			apiModels[i].Host = planModel.Host
+		priorAttrs := match.Attributes()
+
+		typ, _ := attrs["target_type"].(types.String)
+		if host, ok := priorAttrs["host"].(types.String); ok && derivedHostTargets[typ.ValueString()] &&
+			!host.IsNull() && !host.IsUnknown() {
+			attrs["host"] = host
 		}
-		if !planModel.Path.IsNull() && !planModel.Path.IsUnknown() {
-			apiModels[i].Path = planModel.Path
+		if opts, ok := attrs["options"].(types.Object); ok {
+			priorOpts, _ := priorAttrs["options"].(types.Object)
+			attrs["options"] = reconcileObject(ctx, priorOpts, opts)
 		}
-		if !planModel.Options.IsNull() && !planModel.Options.IsUnknown() {
-			apiModels[i].Options = planModel.Options
-		}
+
+		obj, d := types.ObjectValue(cur.AttributeTypes(ctx), attrs)
+		ret.Append(d...)
+		out[i] = obj
+	}
+	if ret.HasError() {
+		return current, ret
 	}
 
-	result, d := types.ListValueFrom(ctx, ReverseProxyServiceTargetModel{}.TFType(), apiModels)
+	result, d := types.ListValue(current.ElementType(ctx), out)
 	ret.Append(d...)
 	return result, ret
+}
+
+// reconcileObject returns current, keeping each prior attribute that means the
+// same as the reported one. The server omits a block whose settings are all
+// empty, so a prior block holding only empty settings is kept when current is
+// null.
+func reconcileObject(ctx context.Context, prior, current types.Object) types.Object {
+	if prior.IsNull() || prior.IsUnknown() {
+		return current
+	}
+	if current.IsNull() {
+		for _, v := range prior.Attributes() {
+			if !isEmptySetting(v) {
+				return current
+			}
+		}
+		return prior
+	}
+
+	attrs := current.Attributes()
+	for name, pv := range prior.Attributes() {
+		if sameSetting(name, pv, attrs[name]) {
+			attrs[name] = pv
+		}
+	}
+	obj, d := types.ObjectValue(current.AttributeTypes(ctx), attrs)
+	if d.HasError() {
+		return current
+	}
+	return obj
+}
+
+// isEmptySetting reports whether v is a value the server does not report: null,
+// false, or an empty collection.
+func isEmptySetting(v attr.Value) bool {
+	if v == nil || v.IsNull() {
+		return true
+	}
+	if v.IsUnknown() {
+		return false
+	}
+	switch tv := v.(type) {
+	case types.Bool:
+		return !tv.ValueBool()
+	case types.Map:
+		return len(tv.Elements()) == 0
+	case types.List:
+		return len(tv.Elements()) == 0
+	}
+	return false
+}
+
+// sameSetting reports whether a prior and a reported value mean the same to the
+// server.
+func sameSetting(name string, prior, current attr.Value) bool {
+	if prior == nil || current == nil || prior.IsUnknown() || current.IsUnknown() {
+		return false
+	}
+	if isEmptySetting(prior) && isEmptySetting(current) {
+		return true
+	}
+	if durationOptions[name] {
+		p, pok := prior.(types.String)
+		c, cok := current.(types.String)
+		if pok && cok && !p.IsNull() && !c.IsNull() {
+			pd, perr := time.ParseDuration(p.ValueString())
+			cd, cerr := time.ParseDuration(c.ValueString())
+			if perr == nil && cerr == nil {
+				return pd == cd
+			}
+		}
+	}
+	return prior.Equal(current)
 }
 
 func reverseProxyServiceTerraformToAPI(ctx context.Context, data *ReverseProxyServiceModel) (api.ServiceRequest, diag.Diagnostics) {
@@ -1282,7 +1381,7 @@ func (r *ReverseProxyService) Create(ctx context.Context, req resource.CreateReq
 	}
 	data.Auth = auth
 
-	targets, targetDiags := preserveTargetPlanValues(ctx, planTargets, data.Targets)
+	targets, targetDiags := reconcileTargets(ctx, planTargets, data.Targets)
 	resp.Diagnostics.Append(targetDiags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -1327,7 +1426,7 @@ func (r *ReverseProxyService) Read(ctx context.Context, req resource.ReadRequest
 	}
 	data.Auth = auth
 
-	targets, targetDiags := preserveTargetPlanValues(ctx, priorTargets, data.Targets)
+	targets, targetDiags := reconcileTargets(ctx, priorTargets, data.Targets)
 	resp.Diagnostics.Append(targetDiags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -1374,7 +1473,7 @@ func (r *ReverseProxyService) Update(ctx context.Context, req resource.UpdateReq
 	}
 	data.Auth = auth
 
-	targets, targetDiags := preserveTargetPlanValues(ctx, planTargets, data.Targets)
+	targets, targetDiags := reconcileTargets(ctx, planTargets, data.Targets)
 	resp.Diagnostics.Append(targetDiags...)
 	if resp.Diagnostics.HasError() {
 		return

@@ -1399,3 +1399,109 @@ func withoutTargetHostAndPath(config string) string {
 	config = strings.Replace(config, "    host        = \"host.docker.internal\"\n", "", 1)
 	return strings.Replace(config, "    path        = \"/\"\n", "", 1)
 }
+
+// A path or option changed outside Terraform has to show up in the next plan.
+// Read used to write the prior state's host, path and options over whatever the
+// server reported, so the change vanished on refresh and a later update sent
+// the stale value back without ever showing it.
+func Test_ReverseProxyService_TargetDriftShows(t *testing.T) {
+	cluster := testRequireProxyCluster(t)
+	rName := "s" + acctest.RandStringFromCharSet(8, acctest.CharSetAlpha)
+	domain := rName + "." + cluster.Address
+	rNameFull := "netbird_reverse_proxy_service." + rName
+	peerID := testPeerID(t, "peer1")
+	config := testReverseProxyServiceDrift(rName, domain, peerID)
+	var createdID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testEnsureManagementRunning(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testCheckGone(testClient().ReverseProxyServices.Get, &createdID),
+		Steps: []resource.TestStep{
+			{
+				// "60s" comes back as "1m0s". The empty plan the framework
+				// checks after this apply is the proof that a canonical
+				// spelling is not mistaken for drift.
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testRecordID(rNameFull, &createdID),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.path", "/app"),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.options.request_timeout", "60s"),
+				),
+			},
+			{
+				PreConfig: func() {
+					ctx := context.Background()
+					svc, err := testClient().ReverseProxyServices.Get(ctx, createdID)
+					if err != nil {
+						t.Fatalf("get service: %v", err)
+					}
+					targets := svc.Targets
+					targets[0].Path = valPtr("/other")
+					targets[0].Options = nil
+					mode := api.ServiceRequestMode(valOr(svc.Mode, api.ServiceModeHttp))
+					if _, err := testClient().ReverseProxyServices.Update(ctx, createdID, api.ServiceRequest{
+						Name:             svc.Name,
+						Domain:           svc.Domain,
+						Enabled:          svc.Enabled,
+						Mode:             &mode,
+						PassHostHeader:   svc.PassHostHeader,
+						RewriteRedirects: svc.RewriteRedirects,
+						Auth:             &svc.Auth,
+						Targets:          &targets,
+					}); err != nil {
+						t.Fatalf("change the service out of band: %v", err)
+					}
+				},
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config,
+				Check: func(*terraform.State) error {
+					svc, err := testClient().ReverseProxyServices.Get(context.Background(), createdID)
+					if err != nil {
+						return fmt.Errorf("get service: %w", err)
+					}
+					tgt := svc.Targets[0]
+					return matchPairs(map[string][]any{
+						"Target.Path":           {"/app", valOr(tgt.Path, "")},
+						"Target.RequestTimeout": {"1m0s", valOr(valOr(tgt.Options, api.ServiceTargetOptions{}).RequestTimeout, "")},
+					})
+				},
+			},
+			{
+				ResourceName:      rNameFull,
+				ImportState:       true,
+				ImportStateVerify: true,
+				// The server reports the duration canonically, which import
+				// cannot map back to the spelling in the configuration.
+				ImportStateVerifyIgnore: []string{"targets.0.options.request_timeout"},
+			},
+		},
+	})
+}
+
+func testReverseProxyServiceDrift(rName, domain, peerID string) string {
+	return fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%s" {
+  name   = %q
+  domain = %q
+
+  targets = [{
+    target_id   = %q
+    target_type = "peer"
+    port        = 8080
+    protocol    = "http"
+    path        = "/app"
+
+    options = {
+      path_rewrite    = "preserve"
+      request_timeout = "60s"
+    }
+  }]
+
+  auth = {}
+}`, rName, rName, domain, peerID)
+}
