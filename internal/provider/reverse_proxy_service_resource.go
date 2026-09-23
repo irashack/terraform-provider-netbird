@@ -14,10 +14,12 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	netbird "github.com/netbirdio/netbird/shared/management/client/rest"
@@ -274,10 +276,12 @@ func (r *ReverseProxyService) Schema(ctx context.Context, req resource.SchemaReq
 				Optional:            true,
 				Computed:            true,
 				Validators:          []validator.Int64{int64validator.Between(0, 65535)},
+				PlanModifiers:       []planmodifier.Int64{int64planmodifier.UseStateForUnknown()},
 			},
 			"port_auto_assigned": schema.BoolAttribute{
 				MarkdownDescription: "Whether the listen port was auto-assigned by the server",
 				Computed:            true,
+				PlanModifiers:       []planmodifier.Bool{keepStateUnlessChanged{path.Root("listen_port")}},
 			},
 			"enabled": schema.BoolAttribute{
 				MarkdownDescription: "Whether the service is enabled",
@@ -300,6 +304,7 @@ func (r *ReverseProxyService) Schema(ctx context.Context, req resource.SchemaReq
 			"proxy_cluster": schema.StringAttribute{
 				MarkdownDescription: "The proxy cluster handling this service (derived from domain)",
 				Computed:            true,
+				PlanModifiers:       []planmodifier.String{keepStateUnlessChanged{path.Root("domain")}},
 			},
 			"private": schema.BoolAttribute{
 				MarkdownDescription: "When true, the service is reachable only over NetBird: peers in `access_groups` authenticate with their WireGuard identity instead of SSO, and management generates the access policy to the cluster's proxy peers. Requires `mode = \"http\"` and at least one access group, and cannot be combined with bearer auth. When unset, the server's current value is kept.",
@@ -905,6 +910,60 @@ func reverseProxyServiceAPIToTerraform(ctx context.Context, svc *api.Service, da
 	}
 
 	return ret
+}
+
+// keepStateUnlessChanged plans a computed attribute as its prior value unless
+// the attribute it is derived from changes: proxy_cluster from domain,
+// port_auto_assigned from listen_port.
+//
+// Every attribute here has to settle back to state when nothing changes. Core
+// proposes null for access_restrictions or target options that state holds but
+// configuration leaves out, because they set non-computed attributes; the
+// framework then counts the resource as changed and marks every unconfigured
+// computed attribute unknown. The list and object modifiers put the blocks
+// back, and an attribute left unknown after that is a plan that is never
+// empty.
+type keepStateUnlessChanged struct {
+	source path.Path
+}
+
+func (m keepStateUnlessChanged) Description(context.Context) string {
+	return fmt.Sprintf("Keeps the prior value unless %s changes.", m.source)
+}
+
+func (m keepStateUnlessChanged) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+// sourceUnchanged reads the source from configuration rather than the plan,
+// because the plan the modifiers see still has the source unknown when it is
+// computed and unconfigured. An unconfigured source keeps its own prior value.
+func (m keepStateUnlessChanged) sourceUnchanged(ctx context.Context, config tfsdk.Config, state tfsdk.State, diags *diag.Diagnostics) bool {
+	var configured, prior attr.Value
+	diags.Append(config.GetAttribute(ctx, m.source, &configured)...)
+	diags.Append(state.GetAttribute(ctx, m.source, &prior)...)
+	if diags.HasError() || configured == nil || configured.IsUnknown() {
+		return false
+	}
+	return configured.IsNull() || configured.Equal(prior)
+}
+
+func (m keepStateUnlessChanged) PlanModifyString(ctx context.Context, req planmodifier.StringRequest, resp *planmodifier.StringResponse) {
+	if req.StateValue.IsNull() || !req.PlanValue.IsUnknown() || req.State.Raw.IsNull() {
+		return
+	}
+	if m.sourceUnchanged(ctx, req.Config, req.State, &resp.Diagnostics) {
+		resp.PlanValue = req.StateValue
+	}
+}
+
+func (m keepStateUnlessChanged) PlanModifyBool(ctx context.Context, req planmodifier.BoolRequest, resp *planmodifier.BoolResponse) {
+	if req.StateValue.IsNull() || !req.PlanValue.IsUnknown() || req.State.Raw.IsNull() {
+		return
+	}
+	if m.sourceUnchanged(ctx, req.Config, req.State, &resp.Diagnostics) {
+		resp.PlanValue = req.StateValue
+	}
 }
 
 // unconfiguredTargetFields are the Optional and Computed target attributes

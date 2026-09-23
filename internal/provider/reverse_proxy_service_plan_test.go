@@ -82,7 +82,10 @@ func configFromState(m ReverseProxyServiceModel) ReverseProxyServiceModel {
 
 // proposedNewState reproduces what Terraform core sends as the proposed new
 // state: the configuration, with every computed attribute the configuration
-// leaves null carried over from prior state.
+// leaves null carried over from prior state. The exception, from core's
+// optionalValueNotComputable, is an Optional and Computed nested attribute
+// whose prior value sets any attribute that is not itself computed: core
+// infers the configuration used to set it and proposes null.
 func proposedNewState(t *testing.T, config, prior ReverseProxyServiceModel) ReverseProxyServiceModel {
 	t.Helper()
 	p := config
@@ -108,7 +111,7 @@ func proposedNewState(t *testing.T, config, prior ReverseProxyServiceModel) Reve
 		t.Fatalf("reading prior targets: %v", d.Errors())
 	}
 	restrictionsComputed, optionsComputed := computedBlocks()
-	if restrictionsComputed && p.AccessRestrictions.IsNull() {
+	if restrictionsComputed && p.AccessRestrictions.IsNull() && !setsAnyAttribute(prior.AccessRestrictions) {
 		p.AccessRestrictions = prior.AccessRestrictions
 	}
 	for i := range cfgTargets {
@@ -121,7 +124,7 @@ func proposedNewState(t *testing.T, config, prior ReverseProxyServiceModel) Reve
 		if cfgTargets[i].Path.IsNull() {
 			cfgTargets[i].Path = priorTargets[i].Path
 		}
-		if optionsComputed && cfgTargets[i].Options.IsNull() {
+		if optionsComputed && cfgTargets[i].Options.IsNull() && !setsAnyAttribute(priorTargets[i].Options) {
 			cfgTargets[i].Options = priorTargets[i].Options
 		}
 	}
@@ -131,6 +134,20 @@ func proposedNewState(t *testing.T, config, prior ReverseProxyServiceModel) Reve
 	}
 	p.Targets = list
 	return p
+}
+
+// setsAnyAttribute reports whether obj holds a non-null attribute. Every
+// attribute inside access_restrictions and target options is Optional only.
+func setsAnyAttribute(obj types.Object) bool {
+	if obj.IsNull() || obj.IsUnknown() {
+		return false
+	}
+	for _, v := range obj.Attributes() {
+		if !v.IsNull() {
+			return true
+		}
+	}
+	return false
 }
 
 // computedBlocks reports whether access_restrictions and target options are
@@ -188,6 +205,33 @@ func protocolErrors(diags []*tfprotov6.Diagnostic) []string {
 // planned state.
 func planUpdate(t *testing.T, prior, config ReverseProxyServiceModel) ReverseProxyServiceModel {
 	t.Helper()
+	_, out := plan(t, prior, config)
+	return out
+}
+
+// planIsEmpty reports whether Terraform would plan no change: core compares the
+// planned state with the prior state.
+func planIsEmpty(t *testing.T, prior, config ReverseProxyServiceModel) bool {
+	t.Helper()
+	raw, _ := plan(t, prior, config)
+	_, empty := reverseProxyServiceProtocol(t)
+	priorDV := dynamicValue(t, empty, prior)
+	priorRaw, err := priorDV.Unmarshal(empty.Raw.Type())
+	if err != nil {
+		t.Fatalf("decoding the prior state: %v", err)
+	}
+	if !raw.Equal(priorRaw) {
+		diffs, _ := priorRaw.Diff(raw)
+		for _, d := range diffs {
+			t.Logf("planned change at %s: %v -> %v", d.Path, d.Value1, d.Value2)
+		}
+		return false
+	}
+	return true
+}
+
+func plan(t *testing.T, prior, config ReverseProxyServiceModel) (tftypes.Value, ReverseProxyServiceModel) {
+	t.Helper()
 	ctx := context.Background()
 	srv, empty := reverseProxyServiceProtocol(t)
 
@@ -208,12 +252,12 @@ func planUpdate(t *testing.T, prior, config ReverseProxyServiceModel) ReversePro
 	if err != nil {
 		t.Fatalf("decoding the planned state: %v", err)
 	}
-	plan := tfsdk.Plan{Schema: empty.Schema, Raw: raw}
+	planned := tfsdk.Plan{Schema: empty.Schema, Raw: raw}
 	var out ReverseProxyServiceModel
-	if d := plan.Get(ctx, &out); d.HasError() {
+	if d := planned.Get(ctx, &out); d.HasError() {
 		t.Fatalf("reading the planned state: %v", d.Errors())
 	}
-	return out
+	return raw, out
 }
 
 // validateConfig runs ValidateResourceConfig and returns the error summaries
@@ -806,5 +850,100 @@ func Test_reverseProxyServicePlan_keepsUnconfiguredMode(t *testing.T) {
 	req := planUpdateRequest(t, prior, config)
 	if req.Mode == nil || *req.Mode != api.ServiceRequestModeTcp {
 		t.Errorf("request mode = %v, want tcp", req.Mode)
+	}
+}
+
+// After an apply that left target options and access restrictions out of the
+// configuration, state still holds them, and core then proposes null for both
+// because they set attributes that are not computed. Any difference from prior
+// state makes the framework mark every unconfigured computed attribute
+// unknown; the modifiers put options and restrictions back, and every other
+// computed attribute has to come back too or the plan is never empty.
+func Test_reverseProxyServicePlan_emptyAfterUnconfiguredBlocks(t *testing.T) {
+	svc := privateServiceAPI()
+	svc.Private = valPtr(false)
+	svc.AccessGroups = nil
+	svc.Targets[0].TargetType = "peer"
+	prior := withRestrictions(t, stateFromAPI(t, svc), map[string]attr.Value{
+		"allowed_countries": types.ListValueMust(types.StringType, []attr.Value{types.StringValue("DE")}),
+	})
+
+	config := configFromState(prior)
+	config.Private = types.BoolNull()
+	config.AccessGroups = types.ListNull(types.StringType)
+	config.AccessRestrictions = types.ObjectNull(ReverseProxyAccessRestrictionsModel{}.TFType().AttrTypes)
+	var targets []ReverseProxyServiceTargetModel
+	if d := config.Targets.ElementsAs(context.Background(), &targets, false); d.HasError() {
+		t.Fatalf("reading targets: %v", d.Errors())
+	}
+	targets[0].Host = types.StringNull()
+	targets[0].Options = types.ObjectNull(ReverseProxyTargetOptionsModel{}.TFType().AttrTypes)
+	config = withTargets(t, config, targets...)
+
+	if !planIsEmpty(t, prior, config) {
+		t.Error("plan right after apply is not empty")
+	}
+}
+
+// Empty blocks remove options and restrictions, and the server then reports
+// neither. State keeps the empty blocks, so the next plan is empty; where
+// state has nothing, as after an import, one update brings it in line.
+func Test_reverseProxyServicePlan_emptyBlocksConverge(t *testing.T) {
+	ctx := context.Background()
+	svc := privateServiceAPI()
+	svc.Targets[0].Options = nil
+	imported := stateFromAPI(t, svc)
+
+	config := withRestrictions(t, configFromState(imported), nil)
+	var targets []ReverseProxyServiceTargetModel
+	if d := config.Targets.ElementsAs(ctx, &targets, false); d.HasError() {
+		t.Fatalf("reading targets: %v", d.Errors())
+	}
+	targets[0].Options = optionsObject(t, nil)
+	config = withTargets(t, config, targets...)
+
+	if planIsEmpty(t, imported, config) {
+		t.Fatal("empty blocks against an import that has none should plan one update")
+	}
+
+	// What Update stores: the API reports no options or restrictions, and
+	// reconciling against the plan keeps the empty blocks.
+	planned := planUpdate(t, imported, config)
+	applied := stateFromAPI(t, svc)
+	applied.AccessRestrictions = reconcileObject(ctx, planned.AccessRestrictions, applied.AccessRestrictions)
+	reconciled, d := reconcileTargets(ctx, planned.Targets, applied.Targets)
+	if d.HasError() {
+		t.Fatalf("reconcileTargets: %v", d.Errors())
+	}
+	applied.Targets = reconciled
+
+	if !planIsEmpty(t, applied, config) {
+		t.Error("plan after applying the empty blocks is not empty")
+	}
+}
+
+// proxy_cluster follows the domain and port_auto_assigned follows listen_port,
+// so each is kept only while its source is.
+func Test_reverseProxyServicePlan_derivedAttributesFollowTheirSource(t *testing.T) {
+	prior := stateFromAPI(t, privateServiceAPI())
+
+	moved := configFromState(prior)
+	moved.Domain = types.StringValue("jellyfin.other.example.com")
+	if got := planUpdate(t, prior, moved).ProxyCluster; !got.IsUnknown() {
+		t.Errorf("proxy_cluster after a domain change = %v, want unknown", got)
+	}
+
+	ported := configFromState(prior)
+	ported.ListenPort = types.Int64Value(15000)
+	if got := planUpdate(t, prior, ported).PortAutoAssigned; !got.IsUnknown() {
+		t.Errorf("port_auto_assigned after a listen_port change = %v, want unknown", got)
+	}
+
+	unchanged := configFromState(prior)
+	unchanged.PassHostHeader = types.BoolValue(false)
+	planned := planUpdate(t, prior, unchanged)
+	if !planned.ProxyCluster.Equal(prior.ProxyCluster) || !planned.PortAutoAssigned.Equal(prior.PortAutoAssigned) || !planned.ListenPort.Equal(prior.ListenPort) {
+		t.Errorf("unrelated update planned proxy_cluster %v, port_auto_assigned %v, listen_port %v; want the prior values",
+			planned.ProxyCluster, planned.PortAutoAssigned, planned.ListenPort)
 	}
 }
