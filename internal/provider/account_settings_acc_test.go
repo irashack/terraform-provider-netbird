@@ -246,3 +246,93 @@ resource "netbird_account_settings" "%s" {
 	ipv6_enabled_groups = %s
 }`, gName, gName, rName, rangeV6, groups)
 }
+
+// Test_Account_UnmanagedSettingsSurviveUpdate covers settings that exist in the
+// API but not in the provider's schema. Management rebuilds the whole settings
+// object from each PUT and resets any field the request leaves out, so a create
+// or an update that touches one modelled attribute must still send every other
+// setting back as the server holds it.
+func Test_Account_UnmanagedSettingsSurviveUpdate(t *testing.T) {
+	env := testE2E(t)
+	ctx := context.Background()
+	client := testClient()
+
+	original := testAccountSettings(t, env.AccountID)
+	t.Cleanup(func() {
+		if _, err := client.Accounts.Update(ctx, env.AccountID, api.AccountRequest{Settings: original}); err != nil {
+			t.Errorf("restore account settings: %v", err)
+		}
+	})
+
+	// Flip each value from whatever the account holds now, so a request that
+	// dropped the field and let the server fall back to its zero value cannot
+	// pass by accident. local_mfa_enabled is the one that matters most: losing
+	// it silently turns TOTP off for local users of the embedded IdP, which is
+	// the IdP the harness runs.
+	want := map[string]bool{
+		"metrics_push_enabled": !valOr(original.MetricsPushEnabled, false),
+		"auto_update_always":   !valOr(original.AutoUpdateAlways, false),
+		"local_mfa_enabled":    !valOr(original.LocalMfaEnabled, false),
+	}
+	settings := testAccountSettings(t, env.AccountID)
+	settings.MetricsPushEnabled = valPtr(want["metrics_push_enabled"])
+	settings.AutoUpdateAlways = valPtr(want["auto_update_always"])
+	settings.LocalMfaEnabled = valPtr(want["local_mfa_enabled"])
+	if _, err := client.Accounts.Update(ctx, env.AccountID, api.AccountRequest{Settings: settings}); err != nil {
+		t.Fatalf("change unmanaged settings out of band: %v", err)
+	}
+	if err := testCheckAccountUnmanagedSettings(env.AccountID, want)(nil); err != nil {
+		t.Fatalf("out-of-band change did not take: %v", err)
+	}
+
+	rName := "acc" + acctest.RandStringFromCharSet(10, acctest.CharSetAlphaNum)
+	rNameFull := "netbird_account_settings." + rName
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testEnsureManagementRunning(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				// Create sends a full PUT as well.
+				Config: testAccountResourceWithJWT(rName, !valOr(original.JwtGroupsEnabled, false)),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "id", env.AccountID),
+					testCheckAccountUnmanagedSettings(env.AccountID, want),
+				),
+			},
+			{
+				// An update to an unrelated modelled attribute.
+				Config: testAccountResourceWithJWT(rName, valOr(original.JwtGroupsEnabled, false)),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "jwt_groups_enabled", fmt.Sprint(valOr(original.JwtGroupsEnabled, false))),
+					testCheckAccountUnmanagedSettings(env.AccountID, want),
+				),
+			},
+		},
+	})
+}
+
+// testCheckAccountUnmanagedSettings asserts the values management holds for
+// settings the configuration never mentions.
+func testCheckAccountUnmanagedSettings(accountID string, want map[string]bool) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		accounts, err := testClient().Accounts.List(context.Background())
+		if err != nil {
+			return err
+		}
+		idx := slices.IndexFunc(accounts, func(a api.Account) bool { return a.Id == accountID })
+		if idx < 0 {
+			return fmt.Errorf("account %s is not among the %d accounts on the management server", accountID, len(accounts))
+		}
+		settings := accounts[idx].Settings
+		got := map[string]bool{
+			"metrics_push_enabled": valOr(settings.MetricsPushEnabled, false),
+			"auto_update_always":   valOr(settings.AutoUpdateAlways, false),
+			"local_mfa_enabled":    valOr(settings.LocalMfaEnabled, false),
+		}
+		pairs := make(map[string][]any, len(want))
+		for name, w := range want {
+			pairs[name] = []any{w, got[name]}
+		}
+		return matchPairs(pairs)
+	}
+}

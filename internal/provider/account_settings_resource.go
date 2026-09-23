@@ -5,6 +5,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -282,36 +283,61 @@ func accountAPIToTerraform(ctx context.Context, account *api.Account, data *Acco
 	return ret
 }
 
-func accountTerraformToAPI(ctx context.Context, account *api.Account, data AccountSettingsModel) api.AccountRequest {
-	return api.AccountRequest{
-		Settings: api.AccountSettings{
-			Extra: &api.AccountExtraSettings{
-				NetworkTrafficLogsEnabled:          boolDefault(data.NetworkTrafficLogsEnabled, account.Settings.Extra.NetworkTrafficLogsEnabled),
-				NetworkTrafficPacketCounterEnabled: boolDefault(data.NetworkTrafficPacketCounterEnabled, account.Settings.Extra.NetworkTrafficPacketCounterEnabled),
-				PeerApprovalEnabled:                boolDefault(data.PeerApprovalEnabled, account.Settings.Extra.PeerApprovalEnabled),
-				UserApprovalRequired:               boolDefault(data.UserApprovalRequired, account.Settings.Extra.UserApprovalRequired),
-				NetworkTrafficLogsGroups:           stringListDefault(ctx, data.NetworkTrafficLogsGroups, account.Settings.Extra.NetworkTrafficLogsGroups),
-			},
-			GroupsPropagationEnabled:        boolDefaultPointer(data.GroupsPropagationEnabled, account.Settings.GroupsPropagationEnabled),
-			JwtAllowGroups:                  stringListDefaultPointer(ctx, data.JwtAllowGroups, account.Settings.JwtAllowGroups),
-			JwtGroupsClaimName:              stringDefaultPointer(data.JwtGroupsClaimName, account.Settings.JwtGroupsClaimName),
-			JwtGroupsEnabled:                boolDefaultPointer(data.JwtGroupsEnabled, account.Settings.JwtGroupsEnabled),
-			PeerInactivityExpiration:        int(int32Default(data.PeerInactivityExpiration, int32(account.Settings.PeerInactivityExpiration))),
-			PeerInactivityExpirationEnabled: boolDefault(data.PeerInactivityExpirationEnabled, account.Settings.PeerInactivityExpirationEnabled),
-			PeerLoginExpiration:             int(int32Default(data.PeerLoginExpiration, int32(account.Settings.PeerLoginExpiration))),
-			PeerLoginExpirationEnabled:      boolDefault(data.PeerLoginExpirationEnabled, account.Settings.PeerLoginExpirationEnabled),
-			RegularUsersViewBlocked:         boolDefault(data.RegularUsersViewBlocked, account.Settings.RegularUsersViewBlocked),
-			RoutingPeerDnsResolutionEnabled: boolDefaultPointer(data.RoutingPeerDnsResolutionEnabled, account.Settings.RoutingPeerDnsResolutionEnabled),
-			AutoUpdateVersion:               stringDefaultPointer(data.AutoUpdateVersion, account.Settings.AutoUpdateVersion),
-			DnsDomain:                       stringDefaultPointer(data.DnsDomain, account.Settings.DnsDomain),
-			NetworkRange:                    stringDefaultPointer(data.NetworkRange, account.Settings.NetworkRange),
-			NetworkRangeV6:                  stringDefaultPointer(data.NetworkRangeV6, account.Settings.NetworkRangeV6),
-			Ipv6EnabledGroups:               stringListDefaultPointer(ctx, data.IPv6EnabledGroups, account.Settings.Ipv6EnabledGroups),
-			LazyConnectionEnabled:           boolDefaultPointer(data.LazyConnectionEnabled, account.Settings.LazyConnectionEnabled),
-			PeerExposeEnabled:               boolDefault(data.PeerExposeEnabled, account.Settings.PeerExposeEnabled),
-			PeerExposeGroups:                stringListDefault(ctx, data.PeerExposeGroups, account.Settings.PeerExposeGroups),
-		},
+// accountTerraformToAPI starts from the account's current settings rather than an
+// empty request because management rebuilds the settings from each PUT and resets
+// every field it omits. Anything the schema does not model is sent back unchanged.
+func accountTerraformToAPI(ctx context.Context, account *api.Account, data AccountSettingsModel) (api.AccountRequest, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	settings, err := cloneAccountSettings(account.Settings)
+	if err != nil {
+		diags.AddError("Error building AccountSettings request", err.Error())
+		return api.AccountRequest{}, diags
 	}
+
+	if settings.Extra == nil {
+		settings.Extra = &api.AccountExtraSettings{}
+	}
+	extra := settings.Extra
+	extra.NetworkTrafficLogsEnabled = boolDefault(data.NetworkTrafficLogsEnabled, extra.NetworkTrafficLogsEnabled)
+	extra.NetworkTrafficPacketCounterEnabled = boolDefault(data.NetworkTrafficPacketCounterEnabled, extra.NetworkTrafficPacketCounterEnabled)
+	extra.PeerApprovalEnabled = boolDefault(data.PeerApprovalEnabled, extra.PeerApprovalEnabled)
+	extra.UserApprovalRequired = boolDefault(data.UserApprovalRequired, extra.UserApprovalRequired)
+	extra.NetworkTrafficLogsGroups = stringListDefault(ctx, data.NetworkTrafficLogsGroups, extra.NetworkTrafficLogsGroups)
+
+	settings.GroupsPropagationEnabled = boolDefaultPointer(data.GroupsPropagationEnabled, settings.GroupsPropagationEnabled)
+	settings.JwtAllowGroups = stringListDefaultPointer(ctx, data.JwtAllowGroups, settings.JwtAllowGroups)
+	settings.JwtGroupsClaimName = stringDefaultPointer(data.JwtGroupsClaimName, settings.JwtGroupsClaimName)
+	settings.JwtGroupsEnabled = boolDefaultPointer(data.JwtGroupsEnabled, settings.JwtGroupsEnabled)
+	settings.PeerInactivityExpiration = int(int32Default(data.PeerInactivityExpiration, int32(settings.PeerInactivityExpiration)))
+	settings.PeerInactivityExpirationEnabled = boolDefault(data.PeerInactivityExpirationEnabled, settings.PeerInactivityExpirationEnabled)
+	settings.PeerLoginExpiration = int(int32Default(data.PeerLoginExpiration, int32(settings.PeerLoginExpiration)))
+	settings.PeerLoginExpirationEnabled = boolDefault(data.PeerLoginExpirationEnabled, settings.PeerLoginExpirationEnabled)
+	settings.RegularUsersViewBlocked = boolDefault(data.RegularUsersViewBlocked, settings.RegularUsersViewBlocked)
+	settings.RoutingPeerDnsResolutionEnabled = boolDefaultPointer(data.RoutingPeerDnsResolutionEnabled, settings.RoutingPeerDnsResolutionEnabled)
+	settings.AutoUpdateVersion = stringDefaultPointer(data.AutoUpdateVersion, settings.AutoUpdateVersion)
+	settings.DnsDomain = stringDefaultPointer(data.DnsDomain, settings.DnsDomain)
+	settings.NetworkRange = stringDefaultPointer(data.NetworkRange, settings.NetworkRange)
+	settings.NetworkRangeV6 = stringDefaultPointer(data.NetworkRangeV6, settings.NetworkRangeV6)
+	settings.Ipv6EnabledGroups = stringListDefaultPointer(ctx, data.IPv6EnabledGroups, settings.Ipv6EnabledGroups)
+	settings.LazyConnectionEnabled = boolDefaultPointer(data.LazyConnectionEnabled, settings.LazyConnectionEnabled)
+	settings.PeerExposeEnabled = boolDefault(data.PeerExposeEnabled, settings.PeerExposeEnabled)
+	settings.PeerExposeGroups = stringListDefault(ctx, data.PeerExposeGroups, settings.PeerExposeGroups)
+
+	return api.AccountRequest{Settings: settings}, diags
+}
+
+// cloneAccountSettings deep-copies through JSON so the request shares no pointers
+// with the fetched account, including fields the API gains after this was written.
+func cloneAccountSettings(settings api.AccountSettings) (api.AccountSettings, error) {
+	var clone api.AccountSettings
+	raw, err := json.Marshal(settings)
+	if err != nil {
+		return clone, fmt.Errorf("copy account settings: %w", err)
+	}
+	if err := json.Unmarshal(raw, &clone); err != nil {
+		return clone, fmt.Errorf("copy account settings: %w", err)
+	}
+	return clone, nil
 }
 
 func (r *AccountSettings) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -332,7 +358,11 @@ func (r *AccountSettings) Create(ctx context.Context, req resource.CreateRequest
 
 	account := &accounts[0]
 
-	updateRequest := accountTerraformToAPI(ctx, account, data)
+	updateRequest, diags := accountTerraformToAPI(ctx, account, data)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	account, err = r.client.Accounts.Update(ctx, account.Id, updateRequest)
 	if err != nil {
@@ -405,7 +435,11 @@ func (r *AccountSettings) Update(ctx context.Context, req resource.UpdateRequest
 	}
 	account := &accounts[0]
 
-	updateRequest := accountTerraformToAPI(ctx, account, data)
+	updateRequest, diags := accountTerraformToAPI(ctx, account, data)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	account, err = r.client.Accounts.Update(ctx, data.Id.ValueString(), updateRequest)
 

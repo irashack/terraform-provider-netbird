@@ -307,10 +307,119 @@ func Test_accountTerraformToAPI(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		out := accountTerraformToAPI(context.Background(), c.currentAccount, c.data)
+		out, diags := accountTerraformToAPI(context.Background(), c.currentAccount, c.data)
+		if diags.HasError() {
+			t.Fatalf("Expected no error diagnostics, found %d errors", diags.ErrorsCount())
+		}
 
 		if !reflect.DeepEqual(out, c.expected) {
 			t.Fatalf("Expected:\n%#v\nFound:\n%#v", c.expected, out)
 		}
+	}
+}
+
+// Test_accountTerraformToAPI_carriesUnmodelledSettings pins the reason the request
+// starts from the current settings: management resets any field a PUT omits, so
+// settings the schema does not model have to be sent back as they are.
+func Test_accountTerraformToAPI_carriesUnmodelledSettings(t *testing.T) {
+	current := &api.Account{
+		Id: "a",
+		Settings: api.AccountSettings{
+			PeerLoginExpiration:      86400,
+			PeerInactivityExpiration: 600,
+			JwtGroupsEnabled:         valPtr(false),
+			AgentNetworkOnly:         valPtr(true),
+			AutoUpdateAlways:         valPtr(true),
+			DashboardFeatures:        &api.AccountDashboardFeatures{AgentNetwork: valPtr(true)},
+			EmbeddedIdpEnabled:       valPtr(true),
+			LocalAuthDisabled:        valPtr(false),
+			LocalMfaEnabled:          valPtr(true),
+			MetricsPushEnabled:       valPtr(true),
+			PeerExposeGroups:         []string{"g1"},
+			Extra: &api.AccountExtraSettings{
+				NetworkTrafficLogsEnabled: true,
+				NetworkTrafficLogsGroups:  []string{"g2"},
+			},
+		},
+	}
+	// A second, independent copy to compare against afterwards: building the
+	// request must not write through to the account it was given.
+	before := &api.Account{}
+	*before = *current
+	before.Settings.DashboardFeatures = &api.AccountDashboardFeatures{AgentNetwork: valPtr(true)}
+	before.Settings.Extra = &api.AccountExtraSettings{
+		NetworkTrafficLogsEnabled: true,
+		NetworkTrafficLogsGroups:  []string{"g2"},
+	}
+
+	data := AccountSettingsModel{
+		Id:                        types.StringValue("a"),
+		JwtGroupsEnabled:          types.BoolValue(true),
+		NetworkTrafficLogsEnabled: types.BoolValue(false),
+		PeerLoginExpiration:       types.Int32Unknown(),
+		NetworkTrafficLogsGroups:  types.ListNull(types.StringType),
+	}
+
+	want := api.AccountRequest{
+		Settings: api.AccountSettings{
+			PeerLoginExpiration:      86400,
+			PeerInactivityExpiration: 600,
+			JwtGroupsEnabled:         valPtr(true),
+			AgentNetworkOnly:         valPtr(true),
+			AutoUpdateAlways:         valPtr(true),
+			DashboardFeatures:        &api.AccountDashboardFeatures{AgentNetwork: valPtr(true)},
+			EmbeddedIdpEnabled:       valPtr(true),
+			LocalAuthDisabled:        valPtr(false),
+			LocalMfaEnabled:          valPtr(true),
+			MetricsPushEnabled:       valPtr(true),
+			PeerExposeGroups:         []string{"g1"},
+			Extra: &api.AccountExtraSettings{
+				NetworkTrafficLogsEnabled: false,
+				NetworkTrafficLogsGroups:  []string{"g2"},
+			},
+		},
+	}
+
+	got, diags := accountTerraformToAPI(context.Background(), current, data)
+	if diags.HasError() {
+		t.Fatalf("Expected no error diagnostics, found %d errors", diags.ErrorsCount())
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Expected:\n%#v\nFound:\n%#v", want, got)
+	}
+	if !reflect.DeepEqual(current, before) {
+		t.Fatalf("current account was modified:\n%#v\nwant:\n%#v", current, before)
+	}
+
+	// The request is sent after the account was fetched and may be adjusted
+	// further; neither may reach into the other.
+	*got.Settings.DashboardFeatures.AgentNetwork = false
+	*got.Settings.MetricsPushEnabled = false
+	got.Settings.Extra.NetworkTrafficLogsGroups[0] = "changed"
+	got.Settings.PeerExposeGroups[0] = "changed"
+	if !reflect.DeepEqual(current, before) {
+		t.Fatalf("request aliases the current account:\n%#v\nwant:\n%#v", current, before)
+	}
+}
+
+// Test_accountTerraformToAPI_nilExtra covers an account whose response carries
+// no extra settings object: the modelled extra attributes still have to reach
+// the request.
+func Test_accountTerraformToAPI_nilExtra(t *testing.T) {
+	current := &api.Account{Id: "a", Settings: api.AccountSettings{PeerLoginExpiration: 3600}}
+	data := AccountSettingsModel{
+		Id:                   types.StringValue("a"),
+		UserApprovalRequired: types.BoolValue(true),
+	}
+
+	got, diags := accountTerraformToAPI(context.Background(), current, data)
+	if diags.HasError() {
+		t.Fatalf("Expected no error diagnostics, found %d errors", diags.ErrorsCount())
+	}
+	if got.Settings.Extra == nil || !got.Settings.Extra.UserApprovalRequired {
+		t.Fatalf("Expected extra.user_approval_required in the request, found %#v", got.Settings.Extra)
+	}
+	if current.Settings.Extra != nil {
+		t.Fatalf("current account was modified: %#v", current.Settings.Extra)
 	}
 }
