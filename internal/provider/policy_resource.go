@@ -20,6 +20,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -33,6 +34,7 @@ import (
 // Ensure provider defined types fully satisfy framework interfaces.
 var _ resource.Resource = &Policy{}
 var _ resource.ResourceWithImportState = &Policy{}
+var _ resource.ResourceWithModifyPlan = &Policy{}
 
 const portStringRegex = "^([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$"
 
@@ -148,6 +150,7 @@ func (r *Policy) Schema(ctx context.Context, req resource.SchemaRequest, resp *r
 						"id": schema.StringAttribute{
 							MarkdownDescription: "Policy ID",
 							Computed:            true,
+							PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 						},
 						"name": schema.StringAttribute{
 							MarkdownDescription: "Policy Name",
@@ -282,6 +285,7 @@ func (r *Policy) Schema(ctx context.Context, req resource.SchemaRequest, resp *r
 				ElementType:         types.StringType,
 				Optional:            true,
 				Computed:            true,
+				PlanModifiers:       []planmodifier.List{listplanmodifier.UseStateForUnknown()},
 			},
 		},
 	}
@@ -705,4 +709,154 @@ func (r *Policy) Delete(ctx context.Context, req resource.DeleteRequest, resp *r
 
 func (r *Policy) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
+}
+
+// ModifyPlan adopts the server's value for rule fields the config leaves out.
+// Terraform plans an unconfigured Optional+Computed field as unknown on any
+// update, the request then omits it, and the policy PUT replaces the whole rule,
+// so the field would be wiped behind a "(known after apply)".
+//
+// UseStateForUnknown cannot do this per attribute: several of these fields are
+// mutually exclusive on the server, so whether the prior value is still valid
+// depends on what else the rule configures.
+func (r *Policy) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+
+	var plan, config, state PolicyModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !isKnown(plan.Rules) || !isKnown(config.Rules) || !isKnown(state.Rules) {
+		return
+	}
+
+	var planRules, configRules, stateRules []PolicyRuleModel
+	resp.Diagnostics.Append(plan.Rules.ElementsAs(ctx, &planRules, false)...)
+	resp.Diagnostics.Append(config.Rules.ElementsAs(ctx, &configRules, false)...)
+	resp.Diagnostics.Append(state.Rules.ElementsAs(ctx, &stateRules, false)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Rules pair up by index. The schema allows exactly one rule, so the
+	// pairing cannot drift when rules are added or reordered.
+	for i := range planRules {
+		if i >= len(configRules) || i >= len(stateRules) {
+			break
+		}
+		planRules[i] = adoptUnconfiguredRuleFields(planRules[i], configRules[i], stateRules[i])
+	}
+
+	rules, d := types.ListValueFrom(ctx, PolicyRuleModel{}.TFType(), planRules)
+	resp.Diagnostics.Append(d...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("rule"), rules)...)
+}
+
+// adoptUnconfiguredRuleFields fills the unknown, unconfigured fields of a
+// planned rule from its prior state. Where the prior value would conflict with
+// what the rule now configures, the field is planned null instead, so the
+// removal shows in the plan rather than failing the request.
+func adoptUnconfiguredRuleFields(plan, config, state PolicyRuleModel) PolicyRuleModel {
+	protocol := plan.Protocol
+
+	if unconfigured(plan.Ports, config.Ports) {
+		switch {
+		case !config.PortRanges.IsNull() || protocolRejectsPorts(protocol):
+			plan.Ports = types.ListNull(types.StringType)
+		case isKnown(protocol):
+			plan.Ports = state.Ports
+		}
+	}
+	if unconfigured(plan.PortRanges, config.PortRanges) {
+		switch {
+		case !config.Ports.IsNull() || protocolRejectsPorts(protocol):
+			plan.PortRanges = types.ListNull(PolicyRulePortRangeModel{}.TFType())
+		case isKnown(protocol):
+			plan.PortRanges = state.PortRanges
+		}
+	}
+
+	resourceType := PolicyRuleResourceModel{}.TFType().AttrTypes
+	if unconfigured(plan.Sources, config.Sources) {
+		plan.Sources = state.Sources
+		if !config.SourceResource.IsNull() {
+			plan.Sources = types.ListNull(types.StringType)
+		}
+	}
+	if unconfigured(plan.SourceResource, config.SourceResource) {
+		plan.SourceResource = state.SourceResource
+		if !config.Sources.IsNull() {
+			plan.SourceResource = types.ObjectNull(resourceType)
+		}
+	}
+	if unconfigured(plan.Destinations, config.Destinations) {
+		plan.Destinations = state.Destinations
+		if !config.DestinationResource.IsNull() {
+			plan.Destinations = types.ListNull(types.StringType)
+		}
+	}
+	if unconfigured(plan.DestinationResource, config.DestinationResource) {
+		plan.DestinationResource = state.DestinationResource
+		if !config.Destinations.IsNull() {
+			plan.DestinationResource = types.ObjectNull(resourceType)
+		}
+	}
+
+	if unconfigured(plan.AuthorizedGroups, config.AuthorizedGroups) {
+		plan.AuthorizedGroups = types.MapNull(types.ListType{ElemType: types.StringType})
+		// The server requires an entry for every source and this provider
+		// rejects keys that are not sources, so the prior map is only still
+		// valid on a netbird-ssh rule whose sources are exactly its keys.
+		if protocol.Equal(types.StringValue("netbird-ssh")) && keysMatchSources(state.AuthorizedGroups, plan.Sources) {
+			plan.AuthorizedGroups = state.AuthorizedGroups
+		}
+	}
+
+	return plan
+}
+
+func unconfigured(plan, config attr.Value) bool {
+	return plan.IsUnknown() && config.IsNull()
+}
+
+func isKnown(v attr.Value) bool {
+	return !v.IsNull() && !v.IsUnknown()
+}
+
+// protocolRejectsPorts reports whether the server refuses ports on this
+// protocol. An unknown protocol is not known to reject them.
+func protocolRejectsPorts(protocol types.String) bool {
+	p := protocol.ValueString()
+	return isKnown(protocol) && (p == "all" || p == "icmp")
+}
+
+func keysMatchSources(authorizedGroups types.Map, sources types.List) bool {
+	if !isKnown(authorizedGroups) || !isKnown(sources) {
+		return false
+	}
+	seen := make(map[string]bool, len(sources.Elements()))
+	for _, v := range sources.Elements() {
+		s, ok := v.(types.String)
+		if !ok || !isKnown(s) {
+			return false
+		}
+		seen[s.ValueString()] = true
+	}
+	if len(seen) != len(authorizedGroups.Elements()) {
+		return false
+	}
+	for k := range authorizedGroups.Elements() {
+		if !seen[k] {
+			return false
+		}
+	}
+	return true
 }
