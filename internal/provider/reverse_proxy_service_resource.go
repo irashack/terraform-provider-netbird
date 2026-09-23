@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
@@ -312,6 +313,7 @@ func (r *ReverseProxyService) Schema(ctx context.Context, req resource.SchemaReq
 			"targets": schema.ListNestedAttribute{
 				MarkdownDescription: "List of target backends for this service",
 				Required:            true,
+				PlanModifiers:       []planmodifier.List{keepUnconfiguredTargetFields{}},
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
 						"target_id": schema.StringAttribute{
@@ -324,7 +326,7 @@ func (r *ReverseProxyService) Schema(ctx context.Context, req resource.SchemaReq
 							Validators:          []validator.String{stringvalidator.OneOf("peer", "host", "domain", "subnet", "cluster")},
 						},
 						"host": schema.StringAttribute{
-							MarkdownDescription: "Backend IP or domain for this target. If omitted, the API resolves it from the target peer.",
+							MarkdownDescription: "Backend IP or domain for this target. If omitted when the target is created, the API resolves it from the target peer or resource; if omitted afterwards, the value the server holds is kept.",
 							Optional:            true,
 							Computed:            true,
 						},
@@ -339,7 +341,7 @@ func (r *ReverseProxyService) Schema(ctx context.Context, req resource.SchemaReq
 							Validators:          []validator.String{stringvalidator.OneOf("http", "https", "tcp", "udp")},
 						},
 						"path": schema.StringAttribute{
-							MarkdownDescription: "URL path prefix for this target. Defaults to \"/\" if omitted.",
+							MarkdownDescription: "URL path prefix for this target. The server routes a target without one as \"/\". If omitted, the value the server holds is kept.",
 							Optional:            true,
 							Computed:            true,
 						},
@@ -850,6 +852,107 @@ func reverseProxyServiceAPIToTerraform(ctx context.Context, svc *api.Service, da
 	}
 
 	return ret
+}
+
+// keepUnconfiguredTargetFields plans a target's host and path, when the
+// configuration leaves them out, as the values the server holds for that target
+// instead of as unknown. The PUT replaces the whole service, so an unknown would
+// be omitted from the request: the server then resets the path and refuses a
+// cluster or subnet target for having no host.
+//
+// Targets are matched on target_id and target_type, so reordering the list does
+// not move one target's values onto another. Targets sharing a resource cannot
+// be told apart that way and fall back to their position.
+type keepUnconfiguredTargetFields struct{}
+
+func (keepUnconfiguredTargetFields) Description(context.Context) string {
+	return "Keeps the server's host and path for targets that do not configure them."
+}
+
+func (m keepUnconfiguredTargetFields) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (keepUnconfiguredTargetFields) PlanModifyList(ctx context.Context, req planmodifier.ListRequest, resp *planmodifier.ListResponse) {
+	if req.StateValue.IsNull() || req.StateValue.IsUnknown() || req.PlanValue.IsNull() || req.PlanValue.IsUnknown() {
+		return
+	}
+
+	prior := req.StateValue.Elements()
+	planned := req.PlanValue.Elements()
+	priorKeys := make([]string, len(prior))
+	priorCount := map[string]int{}
+	for i, e := range prior {
+		priorKeys[i] = targetKey(e)
+		priorCount[priorKeys[i]]++
+	}
+	plannedCount := map[string]int{}
+	for _, e := range planned {
+		plannedCount[targetKey(e)]++
+	}
+
+	changed := false
+	for i, e := range planned {
+		obj, ok := e.(types.Object)
+		key := targetKey(e)
+		if !ok || key == "" {
+			continue
+		}
+		attrs := obj.Attributes()
+		host, _ := attrs["host"].(types.String)
+		targetPath, _ := attrs["path"].(types.String)
+		if !host.IsUnknown() && !targetPath.IsUnknown() {
+			continue
+		}
+
+		match := -1
+		if priorCount[key] == 1 && plannedCount[key] == 1 {
+			match = slices.Index(priorKeys, key)
+		} else if i < len(prior) && priorKeys[i] == key {
+			match = i
+		}
+		if match < 0 {
+			continue
+		}
+
+		priorObj, ok := prior[match].(types.Object)
+		if !ok {
+			continue
+		}
+		priorAttrs := priorObj.Attributes()
+		if host.IsUnknown() {
+			attrs["host"] = priorAttrs["host"]
+		}
+		if targetPath.IsUnknown() {
+			attrs["path"] = priorAttrs["path"]
+		}
+		kept, d := types.ObjectValue(obj.AttributeTypes(ctx), attrs)
+		resp.Diagnostics.Append(d...)
+		planned[i] = kept
+		changed = true
+	}
+	if !changed || resp.Diagnostics.HasError() {
+		return
+	}
+
+	list, d := types.ListValue(req.PlanValue.ElementType(ctx), planned)
+	resp.Diagnostics.Append(d...)
+	resp.PlanValue = list
+}
+
+// targetKey identifies a target by what it points at, or returns "" when that
+// is not known yet.
+func targetKey(v attr.Value) string {
+	obj, ok := v.(types.Object)
+	if !ok || obj.IsNull() || obj.IsUnknown() {
+		return ""
+	}
+	id, _ := obj.Attributes()["target_id"].(types.String)
+	typ, _ := obj.Attributes()["target_type"].(types.String)
+	if id.IsNull() || id.IsUnknown() || typ.IsNull() || typ.IsUnknown() {
+		return ""
+	}
+	return typ.ValueString() + "/" + id.ValueString()
 }
 
 // preserveAuthSecrets copies sensitive auth fields (password, pin) from prior state/plan

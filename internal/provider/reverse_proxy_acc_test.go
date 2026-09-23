@@ -11,7 +11,10 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 
 	"github.com/netbirdio/netbird/shared/management/http/api"
 )
@@ -1254,6 +1257,13 @@ func Test_ReverseProxyService_PrivateImportThenPlan(t *testing.T) {
 				ConfigPlanChecks: updatesInPlace(rNameFull),
 				Check:            testCheckPrivateService(&id, cluster.Address, false, groupA, groupB),
 			},
+			{
+				// The same service described without the target's host and
+				// path: the update keeps the values the server holds.
+				Config:           withoutTargetHostAndPath(testReverseProxyServicePrivate(rName, domain, cluster.Address, true, groupA, groupB)),
+				ConfigPlanChecks: updatesInPlace(rNameFull),
+				Check:            testCheckPrivateService(&id, cluster.Address, true, groupA, groupB),
+			},
 		},
 	})
 }
@@ -1289,4 +1299,103 @@ resource "netbird_reverse_proxy_service" "%s" {
 
   auth = {}
 }`, rName, rName, domain, strings.Join(quoted, ", "), passHostHeader, clusterAddress)
+}
+
+// Leaving a target's host and path out of the configuration after creation
+// used to plan them as unknown, and the request then omitted them. The server
+// replaces the service on update, so it reset the path and refused the subnet
+// target for having no host.
+func Test_ReverseProxyService_KeepsUnconfiguredTargetHostAndPath(t *testing.T) {
+	cluster := testRequireProxyCluster(t)
+	rName := "s" + acctest.RandStringFromCharSet(8, acctest.CharSetAlpha)
+	domain := rName + "." + cluster.Address
+	rNameFull := "netbird_reverse_proxy_service." + rName
+	subnetID := e2eResourceSubnetID()
+	var createdID string
+
+	serverTarget := func(passHostHeader bool) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			svc, err := testClient().ReverseProxyServices.Get(context.Background(), createdID)
+			if err != nil {
+				return fmt.Errorf("get service: %w", err)
+			}
+			if len(svc.Targets) != 1 {
+				return fmt.Errorf("expected 1 target, got %d", len(svc.Targets))
+			}
+			return matchPairs(map[string][]any{
+				"PassHostHeader": {passHostHeader, valOr(svc.PassHostHeader, false)},
+				"Target.Host":    {"192.168.1.10", valOr(svc.Targets[0].Host, "")},
+				"Target.Path":    {"/api", valOr(svc.Targets[0].Path, "")},
+			})
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testEnsureManagementRunning(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testCheckGone(testClient().ReverseProxyServices.Get, &createdID),
+		Steps: []resource.TestStep{
+			{
+				Config: testReverseProxyServiceSubnetTarget(rName, domain, subnetID, false, `
+    host        = "192.168.1.10"
+    path        = "/api"`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testRecordID(rNameFull, &createdID),
+					serverTarget(false),
+				),
+			},
+			{
+				Config: testReverseProxyServiceSubnetTarget(rName, domain, subnetID, true, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(rNameFull, plancheck.ResourceActionUpdate),
+						plancheck.ExpectKnownValue(rNameFull, tfjsonpath.New("targets").AtSliceIndex(0).AtMapKey("host"), knownvalue.StringExact("192.168.1.10")),
+						plancheck.ExpectKnownValue(rNameFull, tfjsonpath.New("targets").AtSliceIndex(0).AtMapKey("path"), knownvalue.StringExact("/api")),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "pass_host_header", "true"),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.host", "192.168.1.10"),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.path", "/api"),
+					serverTarget(true),
+				),
+			},
+			{
+				ResourceName:            rNameFull,
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"auth.password_auth.password"},
+			},
+		},
+	})
+}
+
+func testReverseProxyServiceSubnetTarget(rName, domain, subnetID string, passHostHeader bool, hostAndPath string) string {
+	return fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%s" {
+  name             = %q
+  domain           = %q
+  pass_host_header = %t
+
+  targets = [{
+    target_id   = %q
+    target_type = "subnet"
+    port        = 8080
+    protocol    = "http"%s
+  }]
+
+  auth = {
+    password_auth = {
+      enabled  = true
+      password = "subnet-test"
+    }
+  }
+}`, rName, rName, domain, passHostHeader, subnetID, hostAndPath)
+}
+
+// withoutTargetHostAndPath drops the target's host and path from a
+// configuration built by testReverseProxyServicePrivate.
+func withoutTargetHostAndPath(config string) string {
+	config = strings.Replace(config, "    host        = \"host.docker.internal\"\n", "", 1)
+	return strings.Replace(config, "    path        = \"/\"\n", "", 1)
 }

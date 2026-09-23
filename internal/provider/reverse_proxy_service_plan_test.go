@@ -406,3 +406,202 @@ func Test_reverseProxyService_validateConfig_private(t *testing.T) {
 		})
 	}
 }
+
+// targetModel builds a target the way configuration or state holds one.
+func targetModel(id, typ, host, path string) ReverseProxyServiceTargetModel {
+	str := func(s string) types.String {
+		if s == "" {
+			return types.StringNull()
+		}
+		return types.StringValue(s)
+	}
+	return ReverseProxyServiceTargetModel{
+		TargetId:   types.StringValue(id),
+		TargetType: types.StringValue(typ),
+		Host:       str(host),
+		Port:       types.Int64Value(8080),
+		Protocol:   types.StringValue("http"),
+		Path:       str(path),
+		Enabled:    types.BoolValue(true),
+		Options:    types.ObjectNull(ReverseProxyTargetOptionsModel{}.TFType().AttrTypes),
+	}
+}
+
+func withTargets(t *testing.T, m ReverseProxyServiceModel, targets ...ReverseProxyServiceTargetModel) ReverseProxyServiceModel {
+	t.Helper()
+	list, d := types.ListValueFrom(context.Background(), ReverseProxyServiceTargetModel{}.TFType(), targets)
+	if d.HasError() {
+		t.Fatalf("building targets: %v", d.Errors())
+	}
+	m.Targets = list
+	return m
+}
+
+type hostPath struct{ host, path *string }
+
+func requestHostPaths(req api.ServiceRequest) []hostPath {
+	var out []hostPath
+	for _, tgt := range *req.Targets {
+		out = append(out, hostPath{tgt.Host, tgt.Path})
+	}
+	return out
+}
+
+func (h hostPath) String() string {
+	deref := func(p *string) string {
+		if p == nil {
+			return "<omitted>"
+		}
+		return *p
+	}
+	return "host=" + deref(h.host) + " path=" + deref(h.path)
+}
+
+// A target's host and path are Optional and Computed, so leaving them out of
+// the configuration used to plan them as unknown on every update, and the
+// request then omitted them. The PUT replaces the service: the server reset the
+// path, and refused cluster and subnet targets outright for having no host.
+func Test_reverseProxyServicePlan_keepsUnconfiguredTargetHostAndPath(t *testing.T) {
+	str := func(s string) *string { return &s }
+
+	cases := []struct {
+		name   string
+		prior  []ReverseProxyServiceTargetModel
+		config []ReverseProxyServiceTargetModel
+		want   []hostPath
+	}{
+		{
+			name:   "cluster target",
+			prior:  []ReverseProxyServiceTargetModel{targetModel("proxy.example.com", "cluster", "host.docker.internal", "/")},
+			config: []ReverseProxyServiceTargetModel{targetModel("proxy.example.com", "cluster", "", "")},
+			want:   []hostPath{{str("host.docker.internal"), str("/")}},
+		},
+		{
+			name:   "subnet target with a path",
+			prior:  []ReverseProxyServiceTargetModel{targetModel("res-subnet", "subnet", "192.168.1.10", "/api")},
+			config: []ReverseProxyServiceTargetModel{targetModel("res-subnet", "subnet", "", "")},
+			want:   []hostPath{{str("192.168.1.10"), str("/api")}},
+		},
+		{
+			name:   "configured values win",
+			prior:  []ReverseProxyServiceTargetModel{targetModel("res-subnet", "subnet", "192.168.1.10", "/api")},
+			config: []ReverseProxyServiceTargetModel{targetModel("res-subnet", "subnet", "192.168.1.20", "/v2")},
+			want:   []hostPath{{str("192.168.1.20"), str("/v2")}},
+		},
+		{
+			// A path the server never reported stays absent rather than
+			// becoming an explicit value.
+			name:   "absent on the server",
+			prior:  []ReverseProxyServiceTargetModel{targetModel("peer1", "peer", "100.64.0.1", "")},
+			config: []ReverseProxyServiceTargetModel{targetModel("peer1", "peer", "", "")},
+			want:   []hostPath{{str("100.64.0.1"), nil}},
+		},
+		{
+			// Matching is by target, not by position, so a reordered list
+			// does not hand one target's host to another.
+			name: "reordered targets",
+			prior: []ReverseProxyServiceTargetModel{
+				targetModel("res-a", "subnet", "192.168.1.10", "/a"),
+				targetModel("res-b", "subnet", "192.168.1.20", "/b"),
+			},
+			config: []ReverseProxyServiceTargetModel{
+				targetModel("res-b", "subnet", "", ""),
+				targetModel("res-a", "subnet", "", ""),
+			},
+			want: []hostPath{{str("192.168.1.20"), str("/b")}, {str("192.168.1.10"), str("/a")}},
+		},
+		{
+			// Targets sharing a resource cannot be told apart by it, so they
+			// fall back to position, which is how Terraform itself matches
+			// list elements. In place, that is exact.
+			name: "same resource twice",
+			prior: []ReverseProxyServiceTargetModel{
+				targetModel("res-a", "subnet", "192.168.1.10", "/"),
+				targetModel("res-a", "subnet", "192.168.1.10", "/api"),
+			},
+			config: []ReverseProxyServiceTargetModel{
+				targetModel("res-a", "subnet", "", ""),
+				targetModel("res-a", "subnet", "", ""),
+			},
+			want: []hostPath{{str("192.168.1.10"), str("/")}, {str("192.168.1.10"), str("/api")}},
+		},
+		{
+			// Moved, a shared resource keeps a value only where the same
+			// resource still sits at that position.
+			name: "same resource twice, reordered",
+			prior: []ReverseProxyServiceTargetModel{
+				targetModel("res-a", "subnet", "192.168.1.10", "/a"),
+				targetModel("res-a", "subnet", "192.168.1.10", "/b"),
+				targetModel("res-c", "subnet", "192.168.1.30", "/c"),
+			},
+			config: []ReverseProxyServiceTargetModel{
+				targetModel("res-c", "subnet", "", ""),
+				targetModel("res-a", "subnet", "", ""),
+				targetModel("res-a", "subnet", "", ""),
+			},
+			want: []hostPath{{str("192.168.1.30"), str("/c")}, {str("192.168.1.10"), str("/b")}, {nil, nil}},
+		},
+		{
+			name:  "new target",
+			prior: []ReverseProxyServiceTargetModel{targetModel("res-a", "subnet", "192.168.1.10", "/a")},
+			config: []ReverseProxyServiceTargetModel{
+				targetModel("res-a", "subnet", "", ""),
+				targetModel("peer9", "peer", "", ""),
+			},
+			want: []hostPath{{str("192.168.1.10"), str("/a")}, {nil, nil}},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			base := stateFromAPI(t, privateServiceAPI())
+			prior := withTargets(t, base, c.prior...)
+			config := withTargets(t, configFromState(base), c.config...)
+			config.PassHostHeader = types.BoolValue(false)
+
+			got := requestHostPaths(planUpdateRequest(t, prior, config))
+			if len(got) != len(c.want) {
+				t.Fatalf("got %d targets, want %d", len(got), len(c.want))
+			}
+			for i := range got {
+				if got[i].String() != c.want[i].String() {
+					t.Errorf("target %d: %s, want %s", i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+}
+
+// The deployment shape end to end: import leaves state as the server holds it,
+// the configuration declares the service without host or path, and changing
+// pass_host_header must send everything else back unchanged.
+func Test_reverseProxyServicePlan_privateServiceUpdate(t *testing.T) {
+	prior := stateFromAPI(t, privateServiceAPI())
+	config := configFromState(prior)
+	config.PassHostHeader = types.BoolValue(false)
+	var targets []ReverseProxyServiceTargetModel
+	if d := config.Targets.ElementsAs(context.Background(), &targets, false); d.HasError() {
+		t.Fatalf("reading targets: %v", d.Errors())
+	}
+	targets[0].Host = types.StringNull()
+	targets[0].Path = types.StringNull()
+	config = withTargets(t, config, targets...)
+
+	req := planUpdateRequest(t, prior, config)
+	if req.Private == nil || !*req.Private {
+		t.Errorf("private = %v, want true", req.Private)
+	}
+	if req.AccessGroups == nil || len(*req.AccessGroups) != 2 {
+		t.Errorf("access_groups = %v, want both groups", req.AccessGroups)
+	}
+	if req.PassHostHeader == nil || *req.PassHostHeader {
+		t.Errorf("pass_host_header = %v, want false", req.PassHostHeader)
+	}
+	tgt := (*req.Targets)[0]
+	if got := (hostPath{tgt.Host, tgt.Path}).String(); got != "host=host.docker.internal path=/" {
+		t.Errorf("target %s, want host=host.docker.internal path=/", got)
+	}
+	if tgt.Options == nil || tgt.Options.DirectUpstream == nil || !*tgt.Options.DirectUpstream {
+		t.Errorf("direct_upstream dropped: %+v", tgt.Options)
+	}
+}

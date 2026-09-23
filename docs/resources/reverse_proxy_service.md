@@ -248,9 +248,9 @@ Required:
 Optional:
 
 - `enabled` (Boolean) Whether this target is enabled
-- `host` (String) Backend IP or domain for this target. If omitted, the API resolves it from the target peer.
+- `host` (String) Backend IP or domain for this target. If omitted when the target is created, the API resolves it from the target peer or resource; if omitted afterwards, the value the server holds is kept.
 - `options` (Attributes) Per-target options (see [below for nested schema](#nestedatt--targets--options))
-- `path` (String) URL path prefix for this target. Defaults to "/" if omitted.
+- `path` (String) URL path prefix for this target. The server routes a target without one as "/". If omitted, the value the server holds is kept.
 
 <a id="nestedatt--targets--options"></a>
 ### Nested Schema for `targets.options`
