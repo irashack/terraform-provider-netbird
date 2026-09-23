@@ -192,10 +192,12 @@ func postureCheckAPIToTerraform(ctx context.Context, postureCheck *api.PostureCh
 	var d diag.Diagnostics
 	data.Id = types.StringValue(postureCheck.Id)
 	data.Name = types.StringValue(postureCheck.Name)
-	if postureCheck.Description != nil {
-		data.Description = types.StringValue(*postureCheck.Description)
-	} else {
+	// The API reports an unset description as "". Keep that null when the
+	// plan or prior state is null, so an unconfigured description stays unset.
+	if postureCheck.Description == nil || (*postureCheck.Description == "" && data.Description.IsNull()) {
 		data.Description = types.StringNull()
+	} else {
+		data.Description = types.StringValue(*postureCheck.Description)
 	}
 	if postureCheck.Checks.NbVersionCheck != nil {
 		data.NetbirdVersionCheck, d = types.ObjectValueFrom(

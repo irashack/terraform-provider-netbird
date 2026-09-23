@@ -151,6 +151,36 @@ func Test_postureCheckAPIToTerraform(t *testing.T) {
 	}
 }
 
+// The API returns an unset description as "". With nothing configured the plan
+// holds null, so reading "" back as a value made every create fail as an
+// inconsistent result; a configured "" still has to round-trip as "".
+func Test_postureCheckAPIToTerraform_description(t *testing.T) {
+	cases := []struct {
+		name   string
+		prior  types.String
+		server *string
+		want   types.String
+	}{
+		{"unset stays null", types.StringNull(), valPtr(""), types.StringNull()},
+		{"absent stays null", types.StringNull(), nil, types.StringNull()},
+		{"configured empty stays empty", types.StringValue(""), valPtr(""), types.StringValue("")},
+		{"a server value wins over null", types.StringNull(), valPtr("set elsewhere"), types.StringValue("set elsewhere")},
+		{"cleared elsewhere reads as empty", types.StringValue("old"), valPtr(""), types.StringValue("")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			data := PostureCheckModel{Description: c.prior}
+			d := postureCheckAPIToTerraform(context.Background(), &api.PostureCheck{Id: "pc1", Name: "pc", Description: c.server}, &data)
+			if d.HasError() {
+				t.Fatalf("postureCheckAPIToTerraform: %v", d)
+			}
+			if !data.Description.Equal(c.want) {
+				t.Errorf("description = %s, want %s", data.Description, c.want)
+			}
+		})
+	}
+}
+
 func Test_postureCheckTerraformToAPI(t *testing.T) {
 	cases := []struct {
 		resource PostureCheckModel
