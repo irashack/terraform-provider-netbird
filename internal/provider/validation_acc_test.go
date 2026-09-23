@@ -379,6 +379,31 @@ resource "netbird_reverse_proxy_service" "%[1]s" {
 }`, rName),
 		},
 		{
+			name: "reverse_proxy_service unknown crowdsec_mode",
+			want: oneOf,
+			config: fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%[1]s" {
+  name    = "%[1]s"
+  domain  = "%[1]s.reject.local"
+  enabled = true
+
+  targets = [{
+    target_id   = "whatever"
+    target_type = "peer"
+    port        = 8080
+    protocol    = "http"
+  }]
+  auth = {
+    link_auth = {
+      enabled = true
+    }
+  }
+  access_restrictions = {
+    crowdsec_mode = "block"
+  }
+}`, rName),
+		},
+		{
 			name: "route network_id longer than 40",
 			want: tooLong,
 			config: fmt.Sprintf(`

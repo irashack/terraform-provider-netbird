@@ -7,7 +7,10 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/netbirdio/netbird/shared/management/http/api"
 )
@@ -448,7 +451,7 @@ func Test_reverseProxyServiceAuthModelTFType(t *testing.T) {
 
 func Test_reverseProxyTargetOptionsModelTFType(t *testing.T) {
 	tfType := ReverseProxyTargetOptionsModel{}.TFType()
-	expectedKeys := []string{"skip_tls_verify", "request_timeout", "path_rewrite", "custom_headers", "proxy_protocol", "session_idle_timeout"}
+	expectedKeys := []string{"skip_tls_verify", "request_timeout", "path_rewrite", "custom_headers", "proxy_protocol", "session_idle_timeout", "direct_upstream"}
 	for _, key := range expectedKeys {
 		if _, ok := tfType.AttrTypes[key]; !ok {
 			t.Errorf("Expected key %s in TFType, not found", key)
@@ -1397,4 +1400,200 @@ func mustObjectValue(ctx context.Context, attrTypes map[string]attr.Type, val an
 		panic("failed to create object value in test helper")
 	}
 	return obj
+}
+
+// A NetBird-only service points its target at a proxy cluster and has the proxy
+// dial the upstream directly. Losing direct_upstream on the way back to the
+// server is not cosmetic: management rejects a cluster target without it.
+func Test_reverseProxyServiceRoundtrip_clusterTargetDirectUpstream(t *testing.T) {
+	ctx := context.Background()
+
+	preserve := api.ServiceTargetOptionsPathRewritePreserve
+	original := &api.Service{
+		Id:      "svc-cluster",
+		Name:    "cluster-target",
+		Domain:  "app.proxy.example.com",
+		Enabled: true,
+		Targets: []api.ServiceTarget{
+			{
+				TargetId:   "proxy.example.com",
+				TargetType: api.ServiceTargetTargetTypeCluster,
+				Host:       valPtr("host.docker.internal"),
+				Port:       8096,
+				Protocol:   api.ServiceTargetProtocolHttp,
+				Path:       valPtr("/"),
+				Enabled:    true,
+				Options: &api.ServiceTargetOptions{
+					DirectUpstream: valPtr(true),
+					PathRewrite:    &preserve,
+				},
+			},
+		},
+		Auth: api.ServiceAuthConfig{},
+	}
+
+	var model ReverseProxyServiceModel
+	if d := reverseProxyServiceAPIToTerraform(ctx, original, &model); d.HasError() {
+		t.Fatalf("APIToTerraform: %v", d.Errors())
+	}
+
+	var targets []ReverseProxyServiceTargetModel
+	if d := model.Targets.ElementsAs(ctx, &targets, false); d.HasError() {
+		t.Fatalf("reading targets: %v", d.Errors())
+	}
+	if got := targets[0].TargetType.ValueString(); got != "cluster" {
+		t.Errorf("target_type = %q, want cluster", got)
+	}
+	opts := targets[0].Options.Attributes()
+	if got, ok := opts["direct_upstream"].(types.Bool); !ok || !got.ValueBool() {
+		t.Errorf("options.direct_upstream = %v, want true", opts["direct_upstream"])
+	}
+
+	req, d := reverseProxyServiceTerraformToAPI(ctx, &model)
+	if d.HasError() {
+		t.Fatalf("TerraformToAPI: %v", d.Errors())
+	}
+	target := (*req.Targets)[0]
+	if target.TargetType != api.ServiceTargetTargetTypeCluster {
+		t.Errorf("request target_type = %q, want cluster", target.TargetType)
+	}
+	if target.Options == nil || target.Options.DirectUpstream == nil || !*target.Options.DirectUpstream {
+		t.Fatalf("request dropped direct_upstream: %+v", target.Options)
+	}
+	if target.Options.PathRewrite == nil || *target.Options.PathRewrite != preserve {
+		t.Errorf("request path_rewrite = %v, want preserve", target.Options.PathRewrite)
+	}
+}
+
+// direct_upstream is the only option some targets carry, and the server omits it
+// when false. Both shapes have to land where the other options do: true as an
+// options block, false the same as no options at all, like proxy_protocol.
+func Test_targetOptionsAPIToTerraform_directUpstream(t *testing.T) {
+	ctx := context.Background()
+
+	only, d := targetOptionsAPIToTerraform(ctx, &api.ServiceTargetOptions{DirectUpstream: valPtr(true)})
+	if d.HasError() {
+		t.Fatalf("mapping: %v", d.Errors())
+	}
+	if only.IsNull() {
+		t.Fatal("options with only direct_upstream = true mapped to null")
+	}
+	if got, _ := only.Attributes()["direct_upstream"].(types.Bool); !got.ValueBool() {
+		t.Errorf("direct_upstream = %v, want true", got)
+	}
+
+	off, d := targetOptionsAPIToTerraform(ctx, &api.ServiceTargetOptions{DirectUpstream: valPtr(false)})
+	if d.HasError() {
+		t.Fatalf("mapping: %v", d.Errors())
+	}
+	if !off.IsNull() {
+		t.Errorf("options with only direct_upstream = false should be null, got %v", off)
+	}
+}
+
+func Test_reverseProxyServiceRoundtrip_crowdsecMode(t *testing.T) {
+	ctx := context.Background()
+
+	observe := api.AccessRestrictionsCrowdsecModeObserve
+	original := &api.Service{
+		Id:      "svc-crowdsec",
+		Name:    "crowdsec",
+		Domain:  "cs.example.com",
+		Enabled: true,
+		Targets: []api.ServiceTarget{
+			{
+				TargetId:   "peer1",
+				TargetType: api.ServiceTargetTargetTypePeer,
+				Port:       8080,
+				Protocol:   api.ServiceTargetProtocolHttp,
+				Enabled:    true,
+			},
+		},
+		Auth: api.ServiceAuthConfig{},
+		// The mode on its own, with no CIDR or country lists, is a complete
+		// set of restrictions as far as the server is concerned.
+		AccessRestrictions: &api.AccessRestrictions{CrowdsecMode: &observe},
+	}
+
+	var model ReverseProxyServiceModel
+	if d := reverseProxyServiceAPIToTerraform(ctx, original, &model); d.HasError() {
+		t.Fatalf("APIToTerraform: %v", d.Errors())
+	}
+	if model.AccessRestrictions.IsNull() {
+		t.Fatal("access_restrictions holding only crowdsec_mode mapped to null")
+	}
+	if got, _ := model.AccessRestrictions.Attributes()["crowdsec_mode"].(types.String); got.ValueString() != "observe" {
+		t.Errorf("crowdsec_mode = %v, want observe", got)
+	}
+
+	req, d := reverseProxyServiceTerraformToAPI(ctx, &model)
+	if d.HasError() {
+		t.Fatalf("TerraformToAPI: %v", d.Errors())
+	}
+	if req.AccessRestrictions == nil || req.AccessRestrictions.CrowdsecMode == nil || *req.AccessRestrictions.CrowdsecMode != observe {
+		t.Fatalf("request dropped crowdsec_mode: %+v", req.AccessRestrictions)
+	}
+}
+
+// The enumerations on the schema have to admit every value the API defines,
+// or a service created in the dashboard cannot be described in configuration.
+func Test_reverseProxyServiceSchema_acceptsAPIEnums(t *testing.T) {
+	var resp resource.SchemaResponse
+	(&ReverseProxyService{}).Schema(context.Background(), resource.SchemaRequest{}, &resp)
+
+	targets, ok := resp.Schema.Attributes["targets"].(schema.ListNestedAttribute)
+	if !ok {
+		t.Fatal("targets is not a list nested attribute")
+	}
+	restrictions, ok := resp.Schema.Attributes["access_restrictions"].(schema.SingleNestedAttribute)
+	if !ok {
+		t.Fatal("access_restrictions is not a single nested attribute")
+	}
+	targetType, ok := targets.NestedObject.Attributes["target_type"].(schema.StringAttribute)
+	if !ok {
+		t.Fatal("targets.target_type is not a string attribute")
+	}
+	crowdsecMode, ok := restrictions.Attributes["crowdsec_mode"].(schema.StringAttribute)
+	if !ok {
+		t.Fatal("access_restrictions.crowdsec_mode is not a string attribute")
+	}
+
+	cases := []struct {
+		attr  schema.StringAttribute
+		value string
+	}{
+		{targetType, string(api.ServiceTargetTargetTypeCluster)},
+		{crowdsecMode, string(api.AccessRestrictionsCrowdsecModeEnforce)},
+		{crowdsecMode, string(api.AccessRestrictionsCrowdsecModeObserve)},
+		{crowdsecMode, string(api.AccessRestrictionsCrowdsecModeOff)},
+	}
+	for _, c := range cases {
+		for _, v := range c.attr.Validators {
+			var out validator.StringResponse
+			v.ValidateString(context.Background(), validator.StringRequest{
+				Path:        path.Root("x"),
+				ConfigValue: types.StringValue(c.value),
+			}, &out)
+			if out.Diagnostics.HasError() {
+				t.Errorf("%q rejected: %v", c.value, out.Diagnostics.Errors())
+			}
+		}
+	}
+}
+
+// The data source fills its state from the resource's mapping, so an attribute
+// added to one schema and not the other fails at read time rather than here.
+func Test_reverseProxyServiceDataSourceSchema_matchesResource(t *testing.T) {
+	ctx := context.Background()
+
+	var rs resource.SchemaResponse
+	(&ReverseProxyService{}).Schema(ctx, resource.SchemaRequest{}, &rs)
+	var ds datasource.SchemaResponse
+	(&ReverseProxyServiceDataSource{}).Schema(ctx, datasource.SchemaRequest{}, &ds)
+
+	want := rs.Schema.Type().TerraformType(ctx)
+	got := ds.Schema.Type().TerraformType(ctx)
+	if !got.Equal(want) {
+		t.Errorf("data source type differs from the resource's:\n got  %s\n want %s", got, want)
+	}
 }

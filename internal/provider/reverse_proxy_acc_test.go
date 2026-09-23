@@ -10,6 +10,8 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+
+	"github.com/netbirdio/netbird/shared/management/http/api"
 )
 
 func Test_ReverseProxyClusters_DataSource(t *testing.T) {
@@ -934,4 +936,164 @@ func testAccountSettingsPeerExpose(enabled bool, groupID string) string {
   peer_expose_enabled = %t
   peer_expose_groups  = %s
 }`, enabled, groups)
+}
+
+// A cluster target names the proxy cluster itself and has the proxy dial the
+// upstream directly. Management refuses one without direct_upstream, so this is
+// also the test that the option reaches the server at all.
+func Test_ReverseProxyService_ClusterTarget(t *testing.T) {
+	cluster := testRequireProxyCluster(t)
+	rName := "s" + acctest.RandStringFromCharSet(8, acctest.CharSetAlpha)
+	domain := rName + "." + cluster.Address
+	rNameFull := "netbird_reverse_proxy_service." + rName
+	var createdID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testEnsureManagementRunning(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testCheckGone(testClient().ReverseProxyServices.Get, &createdID),
+		Steps: []resource.TestStep{
+			{
+				Config: testReverseProxyServiceClusterTarget(rName, domain, cluster.Address),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testRecordID(rNameFull, &createdID),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.target_type", "cluster"),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.target_id", cluster.Address),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.host", "host.docker.internal"),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.options.direct_upstream", "true"),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.options.path_rewrite", "preserve"),
+					func(s *terraform.State) error {
+						svc, err := testClient().ReverseProxyServices.Get(context.Background(), createdID)
+						if err != nil {
+							return fmt.Errorf("get service: %w", err)
+						}
+						if len(svc.Targets) != 1 {
+							return fmt.Errorf("expected 1 target, got %d", len(svc.Targets))
+						}
+						tgt := svc.Targets[0]
+						return matchPairs(map[string][]any{
+							"TargetType":             {api.ServiceTargetTargetTypeCluster, tgt.TargetType},
+							"TargetId":               {cluster.Address, tgt.TargetId},
+							"Host":                   {"host.docker.internal", valOr(tgt.Host, "")},
+							"Options.DirectUpstream": {true, tgt.Options != nil && valOr(tgt.Options.DirectUpstream, false)},
+						})
+					},
+				),
+			},
+			{
+				ResourceName:      rNameFull,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func testReverseProxyServiceClusterTarget(rName, domain, clusterAddress string) string {
+	return fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%s" {
+  name   = %q
+  domain = %q
+
+  targets = [{
+    target_id   = %q
+    target_type = "cluster"
+    host        = "host.docker.internal"
+    port        = 8096
+    protocol    = "http"
+    path        = "/"
+
+    options = {
+      direct_upstream = true
+      path_rewrite    = "preserve"
+    }
+  }]
+
+  auth = {}
+}`, rName, rName, domain, clusterAddress)
+}
+
+// The harness proxy runs without CrowdSec, so the cluster reports no support
+// and nothing enforces the mode. What this covers is the part the provider
+// owns: management stores the mode whatever the cluster supports, and it has to
+// come back unchanged through create, update and import.
+func Test_ReverseProxyService_CrowdsecMode(t *testing.T) {
+	cluster := testRequireProxyCluster(t)
+	rName := "s" + acctest.RandStringFromCharSet(8, acctest.CharSetAlpha)
+	domain := rName + "." + cluster.Address
+	rNameFull := "netbird_reverse_proxy_service." + rName
+	peerID := testPeerID(t, "peer1")
+	var createdID string
+
+	serverMode := func(want string) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			svc, err := testClient().ReverseProxyServices.Get(context.Background(), createdID)
+			if err != nil {
+				return fmt.Errorf("get service: %w", err)
+			}
+			if svc.AccessRestrictions == nil || svc.AccessRestrictions.CrowdsecMode == nil {
+				return fmt.Errorf("server holds no crowdsec_mode, want %q", want)
+			}
+			if got := string(*svc.AccessRestrictions.CrowdsecMode); got != want {
+				return fmt.Errorf("server crowdsec_mode = %q, want %q", got, want)
+			}
+			return nil
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testEnsureManagementRunning(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testCheckGone(testClient().ReverseProxyServices.Get, &createdID),
+		Steps: []resource.TestStep{
+			{
+				Config: testReverseProxyServiceCrowdsec(rName, domain, peerID, "observe"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testRecordID(rNameFull, &createdID),
+					resource.TestCheckResourceAttr(rNameFull, "access_restrictions.crowdsec_mode", "observe"),
+					serverMode("observe"),
+				),
+			},
+			{
+				Config:           testReverseProxyServiceCrowdsec(rName, domain, peerID, "enforce"),
+				ConfigPlanChecks: updatesInPlace(rNameFull),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "access_restrictions.crowdsec_mode", "enforce"),
+					serverMode("enforce"),
+				),
+			},
+			{
+				ResourceName:            rNameFull,
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"auth.password_auth.password"},
+			},
+		},
+	})
+}
+
+func testReverseProxyServiceCrowdsec(rName, domain, peerID, mode string) string {
+	return fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%s" {
+  name   = %q
+  domain = %q
+
+  targets = [{
+    target_id   = %q
+    target_type = "peer"
+    port        = 8080
+    protocol    = "http"
+  }]
+
+  auth = {
+    password_auth = {
+      enabled  = true
+      password = "crowdsec-test"
+    }
+  }
+
+  access_restrictions = {
+    crowdsec_mode = %q
+  }
+}`, rName, rName, domain, peerID, mode)
 }

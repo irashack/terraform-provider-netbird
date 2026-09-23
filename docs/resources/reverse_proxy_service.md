@@ -240,8 +240,8 @@ Required:
 
 - `port` (Number) Backend port for this target (0 for scheme default)
 - `protocol` (String) Protocol to use when connecting to the backend (http, https for HTTP mode; tcp, udp for L4 mode)
-- `target_id` (String) Target ID (resource or peer ID)
-- `target_type` (String) Target type (peer, host, domain, subnet)
+- `target_id` (String) Target ID: the peer or network resource ID, or for a `cluster` target the proxy cluster address
+- `target_type` (String) Target type (peer, host, domain, subnet, cluster). A `cluster` target needs `host` and `options.direct_upstream = true`.
 
 Optional:
 
@@ -256,6 +256,7 @@ Optional:
 Optional:
 
 - `custom_headers` (Map of String, Sensitive) Extra headers sent to the backend (HTTP only). Marked sensitive since values commonly carry credentials, e.g. an `Authorization` header.
+- `direct_upstream` (Boolean) Dial this target from the proxy host's own network stack instead of through the proxy's embedded NetBird client, for upstreams reachable without WireGuard (LAN services, localhost sidecars). Required for `cluster` targets.
 - `path_rewrite` (String) Controls how the request path is rewritten before forwarding. Default strips the matched prefix. "preserve" keeps the full original path. (HTTP only)
 - `proxy_protocol` (Boolean) Send PROXY Protocol v2 header to this backend (TCP/TLS only)
 - `request_timeout` (String) Per-target response timeout as a Go duration string (e.g. "30s", "2m")
@@ -273,3 +274,4 @@ Optional:
 - `allowed_countries` (List of String) ISO 3166-1 alpha-2 country codes to allow
 - `blocked_cidrs` (List of String) CIDR blocklist
 - `blocked_countries` (List of String) ISO 3166-1 alpha-2 country codes to block
+- `crowdsec_mode` (String) CrowdSec IP reputation mode: "enforce", "observe" or "off". Takes effect only on a proxy cluster that supports CrowdSec.

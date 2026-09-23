@@ -60,6 +60,7 @@ Read-Only:
 - `allowed_countries` (List of String) ISO 3166-1 alpha-2 country codes to allow
 - `blocked_cidrs` (List of String) CIDR blocklist
 - `blocked_countries` (List of String) ISO 3166-1 alpha-2 country codes to block
+- `crowdsec_mode` (String) CrowdSec IP reputation mode: "enforce", "observe" or "off"
 
 
 <a id="nestedatt--auth"></a>
@@ -130,8 +131,8 @@ Read-Only:
 - `path` (String) URL path prefix for this target
 - `port` (Number) Backend port for this target
 - `protocol` (String) Protocol to use when connecting to the backend (http, https for HTTP mode; tcp, udp for L4 mode)
-- `target_id` (String) Target ID (resource or peer ID)
-- `target_type` (String) Target type (peer, host, domain, subnet)
+- `target_id` (String) Target ID: the peer or network resource ID, or for a `cluster` target the proxy cluster address
+- `target_type` (String) Target type (peer, host, domain, subnet, cluster)
 
 <a id="nestedatt--targets--options"></a>
 ### Nested Schema for `targets.options`
@@ -139,6 +140,7 @@ Read-Only:
 Read-Only:
 
 - `custom_headers` (Map of String, Sensitive) Extra headers sent to the backend (HTTP only). Marked sensitive since values commonly carry credentials, e.g. an `Authorization` header.
+- `direct_upstream` (Boolean) Whether the proxy dials this target from its host's own network stack instead of through its embedded NetBird client
 - `path_rewrite` (String) Controls how the request path is rewritten before forwarding (HTTP only)
 - `proxy_protocol` (Boolean) Send PROXY Protocol v2 header to this backend (TCP/TLS only)
 - `request_timeout` (String) Per-target response timeout as a Go duration string
