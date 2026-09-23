@@ -596,6 +596,22 @@ func validatePrivateService(data *ReverseProxyServiceModel, diags *diag.Diagnost
 	}
 }
 
+// validateAccessGroupsAtApply repeats the access_groups check once every value
+// is known. ValidateConfig lets through groups that are unknown at plan time,
+// and management checks them only on a private service: on a public one it
+// stores them, where they restrict nothing. A private value still unknown here
+// is unconfigured on create, which the server takes as false.
+func validateAccessGroupsAtApply(data *ReverseProxyServiceModel, diags *diag.Diagnostics) {
+	if data.AccessGroups.IsNull() || data.AccessGroups.IsUnknown() || len(data.AccessGroups.Elements()) == 0 {
+		return
+	}
+	if !data.Private.IsUnknown() && data.Private.ValueBool() {
+		return
+	}
+	diags.AddAttributeError(path.Root("access_groups"), "Invalid Attribute Combination",
+		"access_groups applies only to a private service, and this service is public. Set private = true, or remove access_groups.")
+}
+
 // bearerAuthEnabled reports whether auth is known to enable bearer auth. Any
 // unknown along the way reads as not enabled, so plan-time values pass.
 func bearerAuthEnabled(auth types.Object) bool {
@@ -1559,6 +1575,11 @@ func (r *ReverseProxyService) Create(ctx context.Context, req resource.CreateReq
 		return
 	}
 
+	validateAccessGroupsAtApply(&data, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	serviceReq, d := reverseProxyServiceTerraformToAPI(ctx, &data)
 	resp.Diagnostics.Append(d...)
 	if resp.Diagnostics.HasError() {
@@ -1651,6 +1672,11 @@ func (r *ReverseProxyService) Update(ctx context.Context, req resource.UpdateReq
 	var data ReverseProxyServiceModel
 
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	validateAccessGroupsAtApply(&data, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
 	}

@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -1008,5 +1010,56 @@ func Test_reverseProxyServicePlan_sharedTargetPathChange(t *testing.T) {
 		if errs := protocolErrors(func() []*tfprotov6.Diagnostic { r, _ := planResponse(t, prior, config); return r.Diagnostics }()); len(errs) > 0 {
 			t.Fatalf("unexpected errors: %v", errs)
 		}
+	})
+}
+
+// ValidateConfig passes access_groups it cannot see yet, and the server only
+// checks them on a private service: on a public one it stores them and they
+// restrict nothing. Create and Update check again once the values are known,
+// before any request is made.
+func Test_reverseProxyService_applyRejectsAccessGroupsOnPublicService(t *testing.T) {
+	ctx := context.Background()
+	var sr resource.SchemaResponse
+	r := &ReverseProxyService{}
+	r.Schema(ctx, resource.SchemaRequest{}, &sr)
+
+	public := stateFromAPI(t, privateServiceAPI())
+	public.Private = types.BoolValue(false)
+	// On create an unconfigured private is still unknown, and the server
+	// takes it as false.
+	unset := public
+	unset.Private = types.BoolUnknown()
+
+	toPlan := func(m ReverseProxyServiceModel) tfsdk.Plan {
+		p := tfsdk.Plan{Schema: sr.Schema, Raw: tftypes.NewValue(sr.Schema.Type().TerraformType(ctx), nil)}
+		if d := p.Set(ctx, &m); d.HasError() {
+			t.Fatalf("building plan: %v", d.Errors())
+		}
+		return p
+	}
+	emptyState := func() tfsdk.State {
+		return tfsdk.State{Schema: sr.Schema, Raw: tftypes.NewValue(sr.Schema.Type().TerraformType(ctx), nil)}
+	}
+	wantRejected := func(t *testing.T, diags diag.Diagnostics) {
+		t.Helper()
+		if len(diags.Errors()) != 1 {
+			t.Fatalf("want one error, got %v", diags)
+		}
+		if d, ok := diags.Errors()[0].(diag.DiagnosticWithPath); !ok || !d.Path().Equal(path.Root("access_groups")) {
+			t.Errorf("error is not on access_groups: %v", diags.Errors()[0])
+		}
+	}
+
+	for name, m := range map[string]ReverseProxyServiceModel{"private false": public, "private unset": unset} {
+		t.Run("create, "+name, func(t *testing.T) {
+			resp := resource.CreateResponse{State: emptyState()}
+			r.Create(ctx, resource.CreateRequest{Plan: toPlan(m)}, &resp)
+			wantRejected(t, resp.Diagnostics)
+		})
+	}
+	t.Run("update", func(t *testing.T) {
+		resp := resource.UpdateResponse{State: emptyState()}
+		r.Update(ctx, resource.UpdateRequest{Plan: toPlan(public)}, &resp)
+		wantRejected(t, resp.Diagnostics)
 	})
 }
