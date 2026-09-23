@@ -1597,3 +1597,56 @@ func Test_reverseProxyServiceDataSourceSchema_matchesResource(t *testing.T) {
 		t.Errorf("data source type differs from the resource's:\n got  %s\n want %s", got, want)
 	}
 }
+
+func Test_reverseProxyServiceRoundtrip_private(t *testing.T) {
+	ctx := context.Background()
+
+	original := privateServiceAPI()
+	var model ReverseProxyServiceModel
+	if d := reverseProxyServiceAPIToTerraform(ctx, original, &model); d.HasError() {
+		t.Fatalf("APIToTerraform: %v", d.Errors())
+	}
+	if !model.Private.ValueBool() {
+		t.Errorf("private = %v, want true", model.Private)
+	}
+	var groups []string
+	if d := model.AccessGroups.ElementsAs(ctx, &groups, false); d.HasError() {
+		t.Fatalf("reading access_groups: %v", d.Errors())
+	}
+	if !reflect.DeepEqual(groups, *original.AccessGroups) {
+		t.Errorf("access_groups = %v, want %v", groups, *original.AccessGroups)
+	}
+
+	req, d := reverseProxyServiceTerraformToAPI(ctx, &model)
+	if d.HasError() {
+		t.Fatalf("TerraformToAPI: %v", d.Errors())
+	}
+	if req.Private == nil || !*req.Private {
+		t.Errorf("request private = %v, want true", req.Private)
+	}
+	// Order is kept: the server stores and returns the list as sent.
+	if req.AccessGroups == nil || !reflect.DeepEqual(*req.AccessGroups, *original.AccessGroups) {
+		t.Errorf("request access_groups = %v, want %v", req.AccessGroups, *original.AccessGroups)
+	}
+}
+
+// A public service reads back as private = false with no access groups, and
+// the server omits both fields on older versions; neither is an error.
+func Test_reverseProxyServiceAPIToTerraform_public(t *testing.T) {
+	for _, private := range []*bool{nil, valPtr(false)} {
+		svc := privateServiceAPI()
+		svc.Private = private
+		svc.AccessGroups = nil
+
+		var model ReverseProxyServiceModel
+		if d := reverseProxyServiceAPIToTerraform(context.Background(), svc, &model); d.HasError() {
+			t.Fatalf("APIToTerraform: %v", d.Errors())
+		}
+		if model.Private.IsNull() || model.Private.ValueBool() {
+			t.Errorf("private from %v = %v, want false", private, model.Private)
+		}
+		if !model.AccessGroups.IsNull() {
+			t.Errorf("access_groups = %v, want null", model.AccessGroups)
+		}
+	}
+}

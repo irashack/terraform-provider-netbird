@@ -5,6 +5,8 @@ package provider
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
@@ -1096,4 +1098,195 @@ resource "netbird_reverse_proxy_service" "%s" {
     crowdsec_mode = %q
   }
 }`, rName, rName, domain, peerID, mode)
+}
+
+// testRequirePrivateCluster returns the harness cluster after checking it
+// claims the private capability. The harness proxy runs with NB_PROXY_PRIVATE,
+// so a cluster without it is a broken fixture, not a deployment to skip.
+func testRequirePrivateCluster(t *testing.T) api.ProxyCluster {
+	t.Helper()
+	cluster := testRequireProxyCluster(t)
+	if cluster.Private == nil || !*cluster.Private {
+		t.Fatalf("proxy cluster %s does not report the private capability (private = %v)", cluster.Address, cluster.Private)
+	}
+	return cluster
+}
+
+// testCheckPrivateService asserts the server holds the NetBird-only service the
+// configuration describes, which is what an update that drops a field would
+// silently change.
+func testCheckPrivateService(id *string, clusterAddress string, passHostHeader bool, groups ...string) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		svc, err := testClient().ReverseProxyServices.Get(context.Background(), *id)
+		if err != nil {
+			return fmt.Errorf("get service: %w", err)
+		}
+		if svc.AccessGroups == nil || !slices.Equal(*svc.AccessGroups, groups) {
+			return fmt.Errorf("server access_groups = %v, want %v", svc.AccessGroups, groups)
+		}
+		if len(svc.Targets) != 1 {
+			return fmt.Errorf("expected 1 target, got %d", len(svc.Targets))
+		}
+		tgt := svc.Targets[0]
+		return matchPairs(map[string][]any{
+			"Private":                {true, valOr(svc.Private, false)},
+			"Mode":                   {api.ServiceModeHttp, valOr(svc.Mode, "")},
+			"PassHostHeader":         {passHostHeader, valOr(svc.PassHostHeader, false)},
+			"Target.TargetType":      {api.ServiceTargetTargetTypeCluster, tgt.TargetType},
+			"Target.TargetId":        {clusterAddress, tgt.TargetId},
+			"Target.Host":            {"host.docker.internal", valOr(tgt.Host, "")},
+			"Target.Path":            {"/", valOr(tgt.Path, "")},
+			"Target.DirectUpstream":  {true, tgt.Options != nil && valOr(tgt.Options.DirectUpstream, false)},
+			"Target.PathRewriteMode": {api.ServiceTargetOptionsPathRewritePreserve, valOr(valOr(tgt.Options, api.ServiceTargetOptions{}).PathRewrite, "")},
+		})
+	}
+}
+
+// A private service in the shape the dashboard creates: NetBird-only, reached
+// by two groups, pointing at the proxy cluster and dialling a sidecar on the
+// proxy host. The update step changes one unrelated field, which is how the
+// service used to be turned public: the PUT replaces the whole service and
+// private and access_groups were never sent.
+func Test_ReverseProxyService_Private(t *testing.T) {
+	cluster := testRequirePrivateCluster(t)
+	rName := "s" + acctest.RandStringFromCharSet(8, acctest.CharSetAlpha)
+	domain := rName + "." + cluster.Address
+	rNameFull := "netbird_reverse_proxy_service." + rName
+	groupA, groupB := e2eGroupAllID(), e2eGroupNotAllID()
+	var createdID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testEnsureManagementRunning(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testCheckGone(testClient().ReverseProxyServices.Get, &createdID),
+		Steps: []resource.TestStep{
+			{
+				Config: testReverseProxyServicePrivate(rName, domain, cluster.Address, true, groupA, groupB),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testRecordID(rNameFull, &createdID),
+					resource.TestCheckResourceAttr(rNameFull, "private", "true"),
+					resource.TestCheckResourceAttr(rNameFull, "access_groups.#", "2"),
+					resource.TestCheckResourceAttr(rNameFull, "access_groups.0", groupA),
+					resource.TestCheckResourceAttr(rNameFull, "access_groups.1", groupB),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.options.direct_upstream", "true"),
+					testCheckPrivateService(&createdID, cluster.Address, true, groupA, groupB),
+				),
+			},
+			{
+				Config:           testReverseProxyServicePrivate(rName, domain, cluster.Address, false, groupA, groupB),
+				ConfigPlanChecks: updatesInPlace(rNameFull),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "pass_host_header", "false"),
+					resource.TestCheckResourceAttr(rNameFull, "private", "true"),
+					testCheckPrivateService(&createdID, cluster.Address, false, groupA, groupB),
+				),
+			},
+			{
+				ResourceName:      rNameFull,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// The adoption path for services that already exist: import one created
+// outside Terraform, then plan with a configuration declaring what it holds.
+// The plan must be empty, and a later update must leave it private.
+func Test_ReverseProxyService_PrivateImportThenPlan(t *testing.T) {
+	cluster := testRequirePrivateCluster(t)
+	rName := "s" + acctest.RandStringFromCharSet(8, acctest.CharSetAlpha)
+	domain := rName + "." + cluster.Address
+	rNameFull := "netbird_reverse_proxy_service." + rName
+	groupA, groupB := e2eGroupAllID(), e2eGroupNotAllID()
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testEnsureManagementRunning(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testCheckGone(testClient().ReverseProxyServices.Get, &id),
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() {
+					mode := api.ServiceRequestMode(api.ServiceModeHttp)
+					preserve := api.ServiceTargetOptionsPathRewritePreserve
+					svc, err := testClient().ReverseProxyServices.Create(context.Background(), api.ServiceRequest{
+						Name:             rName,
+						Domain:           domain,
+						Enabled:          true,
+						Mode:             &mode,
+						PassHostHeader:   valPtr(true),
+						RewriteRedirects: valPtr(false),
+						Private:          valPtr(true),
+						AccessGroups:     &[]string{groupA, groupB},
+						Auth:             &api.ServiceAuthConfig{},
+						Targets: &[]api.ServiceTarget{{
+							TargetId:   cluster.Address,
+							TargetType: api.ServiceTargetTargetTypeCluster,
+							Host:       valPtr("host.docker.internal"),
+							Port:       8096,
+							Protocol:   api.ServiceTargetProtocolHttp,
+							Path:       valPtr("/"),
+							Enabled:    true,
+							Options: &api.ServiceTargetOptions{
+								DirectUpstream: valPtr(true),
+								PathRewrite:    &preserve,
+							},
+						}},
+					})
+					if err != nil {
+						t.Fatalf("could not create the service to import: %v", err)
+					}
+					id = svc.Id
+				},
+				Config:             testReverseProxyServicePrivate(rName, domain, cluster.Address, true, groupA, groupB),
+				ResourceName:       rNameFull,
+				ImportState:        true,
+				ImportStatePersist: true,
+				ImportStateIdFunc:  func(*terraform.State) (string, error) { return id, nil },
+			},
+			{
+				Config:   testReverseProxyServicePrivate(rName, domain, cluster.Address, true, groupA, groupB),
+				PlanOnly: true,
+			},
+			{
+				Config:           testReverseProxyServicePrivate(rName, domain, cluster.Address, false, groupA, groupB),
+				ConfigPlanChecks: updatesInPlace(rNameFull),
+				Check:            testCheckPrivateService(&id, cluster.Address, false, groupA, groupB),
+			},
+		},
+	})
+}
+
+func testReverseProxyServicePrivate(rName, domain, clusterAddress string, passHostHeader bool, groups ...string) string {
+	quoted := make([]string, len(groups))
+	for i, g := range groups {
+		quoted[i] = fmt.Sprintf("%q", g)
+	}
+	return fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%s" {
+  name              = %q
+  domain            = %q
+  mode              = "http"
+  private           = true
+  access_groups     = [%s]
+  pass_host_header  = %t
+  rewrite_redirects = false
+
+  targets = [{
+    target_id   = %q
+    target_type = "cluster"
+    host        = "host.docker.internal"
+    port        = 8096
+    protocol    = "http"
+    path        = "/"
+
+    options = {
+      direct_upstream = true
+      path_rewrite    = "preserve"
+    }
+  }]
+
+  auth = {}
+}`, rName, rName, domain, strings.Join(quoted, ", "), passHostHeader, clusterAddress)
 }

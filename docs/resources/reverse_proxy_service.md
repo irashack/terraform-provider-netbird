@@ -154,11 +154,13 @@ resource "netbird_reverse_proxy_service" "tls_backend" {
 
 ### Optional
 
+- `access_groups` (List of String) IDs of the groups whose peers may reach a private service over the tunnel. Required when `private` is true, and allowed only then.
 - `access_restrictions` (Attributes) Connection-level access restrictions based on IP or geography (see [below for nested schema](#nestedatt--access_restrictions))
 - `enabled` (Boolean) Whether the service is enabled
 - `listen_port` (Number) Port the proxy listens on (L4/TLS only). Set to 0 for auto-assignment.
 - `mode` (String) Service mode: "http" for L7 reverse proxy, "tcp"/"udp"/"tls" for L4 passthrough
 - `pass_host_header` (Boolean) When true, the original client Host header is passed through to the backend
+- `private` (Boolean) When true, the service is reachable only over NetBird: peers in `access_groups` authenticate with their WireGuard identity instead of SSO, and management generates the access policy to the cluster's proxy peers. Requires `mode = "http"` and at least one access group, and cannot be combined with bearer auth. When unset, the server's current value is kept.
 - `rewrite_redirects` (Boolean) When true, Location headers in backend responses are rewritten to replace the backend address with the public-facing domain
 
 ### Read-Only

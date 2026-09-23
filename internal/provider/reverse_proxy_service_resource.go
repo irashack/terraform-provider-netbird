@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -43,6 +44,8 @@ type ReverseProxyServiceModel struct {
 	PassHostHeader     types.Bool   `tfsdk:"pass_host_header"`
 	RewriteRedirects   types.Bool   `tfsdk:"rewrite_redirects"`
 	ProxyCluster       types.String `tfsdk:"proxy_cluster"`
+	Private            types.Bool   `tfsdk:"private"`
+	AccessGroups       types.List   `tfsdk:"access_groups"`
 	Targets            types.List   `tfsdk:"targets"`
 	Auth               types.Object `tfsdk:"auth"`
 	AccessRestrictions types.Object `tfsdk:"access_restrictions"`
@@ -293,6 +296,19 @@ func (r *ReverseProxyService) Schema(ctx context.Context, req resource.SchemaReq
 				MarkdownDescription: "The proxy cluster handling this service (derived from domain)",
 				Computed:            true,
 			},
+			"private": schema.BoolAttribute{
+				MarkdownDescription: "When true, the service is reachable only over NetBird: peers in `access_groups` authenticate with their WireGuard identity instead of SSO, and management generates the access policy to the cluster's proxy peers. Requires `mode = \"http\"` and at least one access group, and cannot be combined with bearer auth. When unset, the server's current value is kept.",
+				Optional:            true,
+				Computed:            true,
+				// The PUT replaces the whole service, so an unknown here would be
+				// omitted from the request and silently make the service public.
+				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
+			},
+			"access_groups": schema.ListAttribute{
+				MarkdownDescription: "IDs of the groups whose peers may reach a private service over the tunnel. Required when `private` is true, and allowed only then.",
+				Optional:            true,
+				ElementType:         types.StringType,
+			},
 			"targets": schema.ListNestedAttribute{
 				MarkdownDescription: "List of target backends for this service",
 				Required:            true,
@@ -483,6 +499,57 @@ func (r *ReverseProxyService) Schema(ctx context.Context, req resource.SchemaReq
 	}
 }
 
+// ValidateConfig checks the private-service contract at plan time. Management
+// enforces the same rules, but only once the apply has started, and it would
+// otherwise store access groups on a public service where they do nothing.
+func (r *ReverseProxyService) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var data ReverseProxyServiceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() || data.Private.IsUnknown() {
+		return
+	}
+
+	private := data.Private.ValueBool()
+	groupsKnown := !data.AccessGroups.IsUnknown()
+	hasGroups := groupsKnown && !data.AccessGroups.IsNull()
+
+	if !private && hasGroups {
+		resp.Diagnostics.AddAttributeError(path.Root("access_groups"), "Invalid Attribute Combination",
+			"access_groups applies only to a private service. Set private = true, or remove access_groups.")
+		return
+	}
+	if !private {
+		return
+	}
+
+	if groupsKnown && len(data.AccessGroups.Elements()) == 0 {
+		resp.Diagnostics.AddAttributeError(path.Root("access_groups"), "Invalid Attribute Combination",
+			"A private service needs at least one access group: no peer could reach it otherwise.")
+	}
+	if !data.Mode.IsNull() && !data.Mode.IsUnknown() && data.Mode.ValueString() != "http" {
+		resp.Diagnostics.AddAttributeError(path.Root("mode"), "Invalid Attribute Combination",
+			fmt.Sprintf("A private service must use mode \"http\", not %q.", data.Mode.ValueString()))
+	}
+	if bearerAuthEnabled(data.Auth) {
+		resp.Diagnostics.AddAttributeError(path.Root("auth").AtName("bearer_auth").AtName("enabled"), "Invalid Attribute Combination",
+			"A private service authenticates peers by their NetBird identity and cannot also enable bearer auth (SSO).")
+	}
+}
+
+// bearerAuthEnabled reports whether auth is known to enable bearer auth. Any
+// unknown along the way reads as not enabled, so plan-time values pass.
+func bearerAuthEnabled(auth types.Object) bool {
+	if auth.IsNull() || auth.IsUnknown() {
+		return false
+	}
+	bearer, ok := auth.Attributes()["bearer_auth"].(types.Object)
+	if !ok || bearer.IsNull() || bearer.IsUnknown() {
+		return false
+	}
+	enabled, ok := bearer.Attributes()["enabled"].(types.Bool)
+	return ok && !enabled.IsUnknown() && enabled.ValueBool()
+}
+
 func (r *ReverseProxyService) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
 	if req.ProviderData == nil {
 		return
@@ -649,6 +716,16 @@ func reverseProxyServiceAPIToTerraform(ctx context.Context, svc *api.Service, da
 	}
 
 	data.ProxyCluster = types.StringPointerValue(svc.ProxyCluster)
+	data.Private = types.BoolValue(isTrue(svc.Private))
+
+	// The server omits access_groups when the list is empty, and a private
+	// service cannot have an empty one, so empty and absent are both null.
+	if svc.AccessGroups != nil && len(*svc.AccessGroups) > 0 {
+		data.AccessGroups, d = types.ListValueFrom(ctx, types.StringType, *svc.AccessGroups)
+		ret.Append(d...)
+	} else {
+		data.AccessGroups = types.ListNull(types.StringType)
+	}
 
 	var targets []ReverseProxyServiceTargetModel
 	for _, t := range svc.Targets {
@@ -918,6 +995,15 @@ func reverseProxyServiceTerraformToAPI(ctx context.Context, data *ReverseProxySe
 	if !data.RewriteRedirects.IsNull() && !data.RewriteRedirects.IsUnknown() {
 		v := data.RewriteRedirects.ValueBool()
 		req.RewriteRedirects = &v
+	}
+	if !data.Private.IsNull() && !data.Private.IsUnknown() {
+		v := data.Private.ValueBool()
+		req.Private = &v
+	}
+	if !data.AccessGroups.IsNull() && !data.AccessGroups.IsUnknown() {
+		var groups []string
+		ret.Append(data.AccessGroups.ElementsAs(ctx, &groups, false)...)
+		req.AccessGroups = &groups
 	}
 
 	var targetModels []ReverseProxyServiceTargetModel
@@ -1215,6 +1301,7 @@ func (r *ReverseProxyService) ImportState(ctx context.Context, req resource.Impo
 }
 
 var (
-	_ resource.Resource                = &ReverseProxyService{}
-	_ resource.ResourceWithImportState = &ReverseProxyService{}
+	_ resource.Resource                   = &ReverseProxyService{}
+	_ resource.ResourceWithImportState    = &ReverseProxyService{}
+	_ resource.ResourceWithValidateConfig = &ReverseProxyService{}
 )

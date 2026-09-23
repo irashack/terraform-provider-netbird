@@ -158,6 +158,88 @@ resource "netbird_policy" "%[1]s" {
   }
 }`, rName, group, other),
 		},
+		{
+			// Access groups do nothing on a public service: the server would
+			// store them and ignore them.
+			name: "reverse_proxy_service access_groups without private",
+			config: fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%[1]s" {
+  name          = "%[1]s"
+  domain        = "%[1]s.reject.local"
+  access_groups = [%[2]q]
+
+  targets = [{
+    target_id   = "whatever"
+    target_type = "peer"
+    port        = 8080
+    protocol    = "http"
+  }]
+  auth = {}
+}`, rName, group),
+		},
+		{
+			// A private service with no groups is reachable by nobody.
+			name: "reverse_proxy_service private without access_groups",
+			config: fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%[1]s" {
+  name    = "%[1]s"
+  domain  = "%[1]s.reject.local"
+  private = true
+
+  targets = [{
+    target_id   = "whatever"
+    target_type = "peer"
+    port        = 8080
+    protocol    = "http"
+  }]
+  auth = {}
+}`, rName),
+		},
+		{
+			// NetBird-only access is HTTP only.
+			name: "reverse_proxy_service private in tcp mode",
+			config: fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%[1]s" {
+  name          = "%[1]s"
+  domain        = "%[1]s.reject.local"
+  mode          = "tcp"
+  listen_port   = 15433
+  private       = true
+  access_groups = [%[2]q]
+
+  targets = [{
+    target_id   = "whatever"
+    target_type = "peer"
+    port        = 5432
+    protocol    = "tcp"
+  }]
+  auth = {}
+}`, rName, group),
+		},
+		{
+			// A private service authenticates peers by their NetBird identity,
+			// which bearer auth (SSO) would contradict.
+			name: "reverse_proxy_service private with bearer auth",
+			config: fmt.Sprintf(`
+resource "netbird_reverse_proxy_service" "%[1]s" {
+  name          = "%[1]s"
+  domain        = "%[1]s.reject.local"
+  private       = true
+  access_groups = [%[2]q]
+
+  targets = [{
+    target_id   = "whatever"
+    target_type = "peer"
+    port        = 8080
+    protocol    = "http"
+  }]
+  auth = {
+    bearer_auth = {
+      enabled = true
+    }
+  }
+}`, rName, group),
+		},
 	}
 
 	for _, c := range cases {
