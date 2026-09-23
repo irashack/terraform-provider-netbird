@@ -9,7 +9,10 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 )
 
 func Test_Route_Create(t *testing.T) {
@@ -129,6 +132,70 @@ func Test_Route_Update(t *testing.T) {
 			},
 		},
 	})
+}
+
+// skip_auto_apply is Optional+Computed with no default, so leaving it out of the
+// config adopts the server's value. The route PUT resets an omitted value to
+// false, so the plan has to carry the prior value rather than leave it unknown.
+func Test_Route_Update_KeepsUnconfiguredSkipAutoApply(t *testing.T) {
+	testE2E(t)
+	rName := "pc" + acctest.RandStringFromCharSet(10, acctest.CharSetAlpha)
+	rNameFull := "netbird_route." + rName
+	var createdID string
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testEnsureManagementRunning(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testCheckGone(testClient().Routes.Get, &createdID),
+		Steps: []resource.TestStep{
+			{
+				Config: testRouteResourceExitNode(rName, "desc", "true"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testRecordID(rNameFull, &createdID),
+					resource.TestCheckResourceAttr(rNameFull, "skip_auto_apply", "true"),
+				),
+			},
+			{
+				Config: testRouteResourceExitNode(rName, "desc-updated", "null"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						testExpectUpdateInPlace(rNameFull),
+						plancheck.ExpectKnownValue(rNameFull, tfjsonpath.New("skip_auto_apply"), knownvalue.Bool(true)),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "description", "desc-updated"),
+					resource.TestCheckResourceAttr(rNameFull, "skip_auto_apply", "true"),
+					func(s *terraform.State) error {
+						route, err := testClient().Routes.Get(context.Background(), createdID)
+						if err != nil {
+							return err
+						}
+						return matchPairs(map[string][]any{
+							"description":     {"desc-updated", route.Description},
+							"skip_auto_apply": {true, route.SkipAutoApply},
+						})
+					},
+				),
+			},
+			{
+				ResourceName:      rNameFull,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func testRouteResourceExitNode(rName, description, skipAutoApply string) string {
+	return fmt.Sprintf(`resource "netbird_route" "%[1]s" {
+  network_id      = "%[1]s"
+  network         = "0.0.0.0/0"
+  groups          = [%[2]q]
+  peer_groups     = [%[3]q]
+  description     = "%[4]s"
+  skip_auto_apply = %[5]s
+}
+`, rName, e2eGroupAllID(), e2eGroupNotAllID(), description, skipAutoApply)
 }
 
 func testRouteResource(rName, groups, aclGroups, description, network, domains, peerGroups, peer string) string {
