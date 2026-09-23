@@ -777,3 +777,34 @@ func Test_reverseProxyServicePlan_keepsUnconfiguredOptionsAndRestrictions(t *tes
 		}
 	})
 }
+
+// mode is Optional and Computed, so an L4 service whose configuration leaves it
+// out planned it as unknown on update and the request omitted it. The server
+// defaults a missing mode to "http" and refuses the change from "tcp", so every
+// update to such a service failed.
+func Test_reverseProxyServicePlan_keepsUnconfiguredMode(t *testing.T) {
+	svc := privateServiceAPI()
+	tcp := api.ServiceModeTcp
+	svc.Mode = &tcp
+	svc.ListenPort = valPtr(15432)
+	svc.Private = valPtr(false)
+	svc.AccessGroups = nil
+	svc.Targets = []api.ServiceTarget{{
+		TargetId:   "peer1",
+		TargetType: api.ServiceTargetTargetTypePeer,
+		Host:       valPtr("100.64.0.9"),
+		Port:       5432,
+		Protocol:   api.ServiceTargetProtocolTcp,
+		Enabled:    true,
+	}}
+	prior := stateFromAPI(t, svc)
+	config := configFromState(prior)
+	config.Mode = types.StringNull()
+	config.Private = types.BoolNull()
+	config.ListenPort = types.Int64Value(15433)
+
+	req := planUpdateRequest(t, prior, config)
+	if req.Mode == nil || *req.Mode != api.ServiceRequestModeTcp {
+		t.Errorf("request mode = %v, want tcp", req.Mode)
+	}
+}

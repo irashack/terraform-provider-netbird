@@ -261,10 +261,13 @@ func (r *ReverseProxyService) Schema(ctx context.Context, req resource.SchemaReq
 				Validators:          []validator.String{stringvalidator.LengthAtLeast(1)},
 			},
 			"mode": schema.StringAttribute{
-				MarkdownDescription: "Service mode: \"http\" for L7 reverse proxy, \"tcp\"/\"udp\"/\"tls\" for L4 passthrough",
+				MarkdownDescription: "Service mode: \"http\" for L7 reverse proxy, \"tcp\"/\"udp\"/\"tls\" for L4 passthrough. When unset, the server's current value is kept, and a new service is \"http\".",
 				Optional:            true,
 				Computed:            true,
 				Validators:          []validator.String{stringvalidator.OneOf("http", "tcp", "udp", "tls")},
+				// A mode omitted from the update reads as "http" to the server,
+				// which refuses to change an L4 service to it.
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 			"listen_port": schema.Int64Attribute{
 				MarkdownDescription: "Port the proxy listens on (L4/TLS only). Set to 0 for auto-assignment.",

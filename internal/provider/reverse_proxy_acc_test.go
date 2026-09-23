@@ -1679,3 +1679,47 @@ resource "netbird_reverse_proxy_service" "%s" {
 		},
 	})
 }
+
+// An L4 service whose configuration stops naming its mode has to keep it. The
+// update used to omit an unconfigured mode, which the server reads as "http"
+// and refuses for a TCP service.
+func Test_ReverseProxyService_KeepsUnconfiguredMode(t *testing.T) {
+	cluster := testRequireProxyCluster(t)
+	rName := "s" + acctest.RandStringFromCharSet(8, acctest.CharSetAlpha)
+	domain := rName + "." + cluster.Address
+	rNameFull := "netbird_reverse_proxy_service." + rName
+	peerID := testPeerID(t, "peer1")
+	var createdID string
+
+	withoutMode := strings.Replace(testReverseProxyServiceL4(rName, domain, peerID, "tcp", 15434, `
+    options = {
+      request_timeout = "1m0s"
+    }`), "  mode        = \"tcp\"\n", "", 1)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testEnsureManagementRunning(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testCheckGone(testClient().ReverseProxyServices.Get, &createdID),
+		Steps: []resource.TestStep{
+			{
+				Config: testReverseProxyServiceL4(rName, domain, peerID, "tcp", 15434, ""),
+				Check:  testRecordID(rNameFull, &createdID),
+			},
+			{
+				Config:           withoutMode,
+				ConfigPlanChecks: updatesInPlace(rNameFull),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "mode", "tcp"),
+					resource.TestCheckResourceAttr(rNameFull, "targets.0.options.request_timeout", "1m0s"),
+					func(*terraform.State) error {
+						svc, err := testClient().ReverseProxyServices.Get(context.Background(), createdID)
+						if err != nil {
+							return fmt.Errorf("get service: %w", err)
+						}
+						return matchPairs(map[string][]any{"Mode": {api.ServiceModeTcp, valOr(svc.Mode, "")}})
+					},
+				),
+			},
+		},
+	})
+}
