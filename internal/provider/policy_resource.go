@@ -601,7 +601,9 @@ func (r *Policy) Create(ctx context.Context, req resource.CreateRequest, resp *r
 		return
 	}
 
+	prior := data
 	resp.Diagnostics.Append(policyAPIToTerraform(ctx, policy, &data)...)
+	resp.Diagnostics.Append(keepEmptyCollections(ctx, prior, &data)...)
 
 	if resp.Diagnostics.HasError() {
 		return
@@ -636,7 +638,9 @@ func (r *Policy) Read(ctx context.Context, req resource.ReadRequest, resp *resou
 		return
 	}
 
+	prior := data
 	resp.Diagnostics.Append(policyAPIToTerraform(ctx, policy, &data)...)
+	resp.Diagnostics.Append(keepEmptyCollections(ctx, prior, &data)...)
 
 	if resp.Diagnostics.HasError() {
 		return
@@ -682,7 +686,9 @@ func (r *Policy) Update(ctx context.Context, req resource.UpdateRequest, resp *r
 		return
 	}
 
+	prior := data
 	resp.Diagnostics.Append(policyAPIToTerraform(ctx, policy, &data)...)
+	resp.Diagnostics.Append(keepEmptyCollections(ctx, prior, &data)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -859,4 +865,50 @@ func keysMatchSources(authorizedGroups types.Map, sources types.List) bool {
 		}
 	}
 	return true
+}
+
+// keepEmptyCollections keeps an empty collection from the plan or prior state
+// where the server reports none. An explicit empty value is how a user clears an
+// Optional+Computed field, and the API drops empty posture checks, ports, port
+// ranges and authorized groups, so without this the apply would return null for
+// a planned empty value and the next plan would diff against it.
+func keepEmptyCollections(ctx context.Context, prior PolicyModel, data *PolicyModel) diag.Diagnostics {
+	var ret diag.Diagnostics
+	if isEmptyList(prior.SourcePostureChecks) && data.SourcePostureChecks.IsNull() {
+		data.SourcePostureChecks = prior.SourcePostureChecks
+	}
+	if !isKnown(prior.Rules) || !isKnown(data.Rules) {
+		return ret
+	}
+
+	var priorRules, rules []PolicyRuleModel
+	ret.Append(prior.Rules.ElementsAs(ctx, &priorRules, false)...)
+	ret.Append(data.Rules.ElementsAs(ctx, &rules, false)...)
+	if ret.HasError() {
+		return ret
+	}
+	for i := range rules {
+		if i >= len(priorRules) {
+			break
+		}
+		p := priorRules[i]
+		if isEmptyList(p.Ports) && rules[i].Ports.IsNull() {
+			rules[i].Ports = p.Ports
+		}
+		if isEmptyList(p.PortRanges) && rules[i].PortRanges.IsNull() {
+			rules[i].PortRanges = p.PortRanges
+		}
+		if isKnown(p.AuthorizedGroups) && len(p.AuthorizedGroups.Elements()) == 0 && rules[i].AuthorizedGroups.IsNull() {
+			rules[i].AuthorizedGroups = p.AuthorizedGroups
+		}
+	}
+
+	var d diag.Diagnostics
+	data.Rules, d = types.ListValueFrom(ctx, PolicyRuleModel{}.TFType(), rules)
+	ret.Append(d...)
+	return ret
+}
+
+func isEmptyList(l types.List) bool {
+	return isKnown(l) && len(l.Elements()) == 0
 }

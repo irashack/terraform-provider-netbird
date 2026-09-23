@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
@@ -365,5 +366,73 @@ func Test_adoptUnconfiguredRuleFields(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Clearing an Optional+Computed field takes an explicit empty value, since
+// leaving it out adopts the server's. The API reports an empty ports, port
+// ranges, authorized groups or posture checks as absent, so the empty value has
+// to survive the read or the apply returns something other than the plan.
+func Test_keepEmptyCollections(t *testing.T) {
+	ctx := context.Background()
+	emptyAG := types.MapValueMust(authGroupsType, map[string]attr.Value{})
+
+	ruleList := func(r PolicyRuleModel) types.List {
+		l, d := types.ListValueFrom(ctx, PolicyRuleModel{}.TFType(), []PolicyRuleModel{r})
+		if d.HasError() {
+			t.Fatalf("building rules: %v", d)
+		}
+		return l
+	}
+
+	priorRule := ruleAllNull("netbird-ssh")
+	priorRule.Ports = strList()
+	priorRule.PortRanges = types.ListValueMust(portRangeType, []attr.Value{})
+	priorRule.Sources = strList("g1")
+	priorRule.AuthorizedGroups = emptyAG
+	prior := PolicyModel{SourcePostureChecks: strList(), Rules: ruleList(priorRule)}
+
+	readRule := ruleAllNull("netbird-ssh")
+	readRule.Sources = strList("g1")
+	data := PolicyModel{SourcePostureChecks: types.ListNull(types.StringType), Rules: ruleList(readRule)}
+
+	if d := keepEmptyCollections(ctx, prior, &data); d.HasError() {
+		t.Fatalf("keepEmptyCollections: %v", d)
+	}
+
+	if !data.SourcePostureChecks.Equal(strList()) {
+		t.Errorf("source_posture_checks = %s, want []", data.SourcePostureChecks)
+	}
+	var rules []PolicyRuleModel
+	if d := data.Rules.ElementsAs(ctx, &rules, false); d.HasError() || len(rules) != 1 {
+		t.Fatalf("rules = %s: %v", data.Rules, d)
+	}
+	got := rules[0]
+	for _, f := range []struct {
+		name      string
+		got, want attr.Value
+	}{
+		{"ports", got.Ports, priorRule.Ports},
+		{"port_ranges", got.PortRanges, priorRule.PortRanges},
+		{"authorized_groups", got.AuthorizedGroups, emptyAG},
+		{"sources", got.Sources, strList("g1")},
+	} {
+		if !f.got.Equal(f.want) {
+			t.Errorf("%s = %s, want %s", f.name, f.got, f.want)
+		}
+	}
+
+	// A value the server does report wins over the prior one, and a prior
+	// null stays null.
+	data = PolicyModel{SourcePostureChecks: strList("pc1"), Rules: ruleList(readRule)}
+	prior = PolicyModel{SourcePostureChecks: strList(), Rules: ruleList(ruleAllNull("tcp"))}
+	if d := keepEmptyCollections(ctx, prior, &data); d.HasError() {
+		t.Fatalf("keepEmptyCollections: %v", d)
+	}
+	if !data.SourcePostureChecks.Equal(strList("pc1")) {
+		t.Errorf("source_posture_checks = %s, want [pc1]", data.SourcePostureChecks)
+	}
+	if !data.Rules.Equal(ruleList(readRule)) {
+		t.Errorf("rules = %s, want the read value unchanged", data.Rules)
 	}
 }

@@ -267,7 +267,11 @@ func Test_Policy_Update_KeepsUnconfiguredFields(t *testing.T) {
 		CheckDestroy:             testCheckGone(testClient().Policies.Get, &createdID),
 		Steps: []resource.TestStep{
 			{
-				Config: testPolicyResourceUnconfigured(rName, true, "desc", "accept"),
+				Config: testPolicyResourceWith(rName, "desc", "accept",
+					fmt.Sprintf(`source_posture_checks = [netbird_posture_check.%s.id]`, rName),
+					fmt.Sprintf(`sources = [%q]
+		destinations = [%q]
+		ports = ["443"]`, e2eGroupAllID(), e2eGroupNotAllID())),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					testRecordID(rNameFull, &createdID),
 					resource.TestCheckResourceAttrPair(rNameFull, "source_posture_checks.0", pcNameFull, "id"),
@@ -277,7 +281,7 @@ func Test_Policy_Update_KeepsUnconfiguredFields(t *testing.T) {
 			{
 				// Only the description and the rule action are configured to
 				// change; everything else is dropped from the config.
-				Config: testPolicyResourceUnconfigured(rName, false, "desc-updated", "drop"),
+				Config: testPolicyResourceWith(rName, "desc-updated", "drop", "", ""),
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{
 						testExpectUpdateInPlace(rNameFull),
@@ -331,6 +335,28 @@ func Test_Policy_Update_KeepsUnconfiguredFields(t *testing.T) {
 				ResourceName:      rNameFull,
 				ImportState:       true,
 				ImportStateVerify: true,
+			},
+			{
+				// With omission meaning "keep", an explicit empty value is how
+				// a field is cleared. The server reports it as absent, so this
+				// also checks the empty value survives the apply.
+				Config: testPolicyResourceWith(rName, "desc-updated", "drop",
+					`source_posture_checks = []`, `ports = []`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "source_posture_checks.#", "0"),
+					resource.TestCheckResourceAttr(rNameFull, "rule.0.ports.#", "0"),
+					resource.TestCheckResourceAttr(rNameFull, "rule.0.sources.0", e2eGroupAllID()),
+					func(s *terraform.State) error {
+						policy, err := testClient().Policies.Get(context.Background(), createdID)
+						if err != nil {
+							return err
+						}
+						return matchPairs(map[string][]any{
+							"SourcePostureChecks.#": {0, len(policy.SourcePostureChecks)},
+							"Rules[0].Ports":        {nil, policy.Rules[0].Ports},
+						})
+					},
+				),
 			},
 		},
 	})
@@ -392,7 +418,25 @@ func Test_Policy_Update_KeepsUnconfiguredAuthorizedGroups(t *testing.T) {
 				ImportStateVerify: true,
 			},
 			{
-				Config: testPolicyResourceSSH(rName, "tcp", "third", "null"),
+				Config: testPolicyResourceSSH(rName, "netbird-ssh", "third", "{}"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "rule.0.authorized_groups.%", "0"),
+					func(s *terraform.State) error {
+						policy, err := testClient().Policies.Get(context.Background(), createdID)
+						if err != nil {
+							return err
+						}
+						return matchPairs(map[string][]any{
+							"Rules[0].AuthorizedGroups": {nil, policy.Rules[0].AuthorizedGroups},
+						})
+					},
+				),
+			},
+			{
+				Config: testPolicyResourceSSH(rName, "netbird-ssh", "fourth", fmt.Sprintf(`{ %q = ["root"] }`, e2eGroupAllID())),
+			},
+			{
+				Config: testPolicyResourceSSH(rName, "tcp", "fifth", "null"),
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{
 						plancheck.ExpectKnownValue(rNameFull, agPath, knownvalue.Null()),
@@ -417,17 +461,9 @@ func Test_Policy_Update_KeepsUnconfiguredAuthorizedGroups(t *testing.T) {
 	})
 }
 
-// testPolicyResourceUnconfigured sets source_posture_checks, ports, sources and
-// destinations only when full is true, so the next step can drop them.
-func testPolicyResourceUnconfigured(rName string, full bool, description, action string) string {
-	optional := ""
-	ruleOptional := ""
-	if full {
-		optional = fmt.Sprintf(`source_posture_checks = [netbird_posture_check.%s.id]`, rName)
-		ruleOptional = fmt.Sprintf(`sources      = [%q]
-		destinations = [%q]
-		ports        = ["443"]`, e2eGroupAllID(), e2eGroupNotAllID())
-	}
+// testPolicyResourceWith is a tcp policy whose optional fields are exactly the
+// HCL passed in, so a step can drop or clear them.
+func testPolicyResourceWith(rName, description, action, policyHCL, ruleHCL string) string {
 	return fmt.Sprintf(`resource "netbird_posture_check" "%[1]s" {
 	name = "%[1]s"
 
@@ -448,7 +484,7 @@ resource "netbird_policy" "%[1]s" {
 		protocol = "tcp"
 		%[5]s
 	}
-}`, rName, description, optional, action, ruleOptional)
+}`, rName, description, policyHCL, action, ruleHCL)
 }
 
 func testPolicyResourceSSH(rName, protocol, ruleDescription, authorizedGroups string) string {
