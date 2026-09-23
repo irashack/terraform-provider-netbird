@@ -71,6 +71,7 @@ func Test_accountAPIToTerraform(t *testing.T) {
 				NetworkTrafficLogsGroups:           types.ListNull(types.StringType),
 				PeerExposeEnabled:                  types.BoolValue(false),
 				PeerExposeGroups:                   types.ListNull(types.StringType),
+				LocalMfaEnabled:                    types.BoolNull(),
 			},
 		},
 		{
@@ -95,6 +96,7 @@ func Test_accountAPIToTerraform(t *testing.T) {
 					RoutingPeerDnsResolutionEnabled: valPtr(true),
 					PeerExposeEnabled:               true,
 					PeerExposeGroups:                []string{"group1"},
+					LocalMfaEnabled:                 valPtr(true),
 					Extra: &api.AccountExtraSettings{
 						NetworkTrafficLogsEnabled:          true,
 						NetworkTrafficPacketCounterEnabled: true,
@@ -129,6 +131,7 @@ func Test_accountAPIToTerraform(t *testing.T) {
 				NetworkTrafficLogsGroups:           types.ListValueMust(types.StringType, []attr.Value{types.StringValue("group1")}),
 				PeerExposeEnabled:                  types.BoolValue(true),
 				PeerExposeGroups:                   types.ListValueMust(types.StringType, []attr.Value{types.StringValue("group1")}),
+				LocalMfaEnabled:                    types.BoolValue(true),
 			},
 		},
 	}
@@ -273,6 +276,7 @@ func Test_accountTerraformToAPI(t *testing.T) {
 				NetworkTrafficLogsGroups:           types.ListValueMust(types.StringType, []attr.Value{types.StringValue("group1")}),
 				PeerExposeEnabled:                  types.BoolValue(true),
 				PeerExposeGroups:                   types.ListValueMust(types.StringType, []attr.Value{types.StringValue("group1")}),
+				LocalMfaEnabled:                    types.BoolValue(true),
 			},
 			expected: api.AccountRequest{
 				Settings: api.AccountSettings{
@@ -294,6 +298,7 @@ func Test_accountTerraformToAPI(t *testing.T) {
 					RoutingPeerDnsResolutionEnabled: valPtr(true),
 					PeerExposeEnabled:               true,
 					PeerExposeGroups:                []string{"group1"},
+					LocalMfaEnabled:                 valPtr(true),
 					Extra: &api.AccountExtraSettings{
 						NetworkTrafficLogsEnabled:          true,
 						NetworkTrafficPacketCounterEnabled: true,

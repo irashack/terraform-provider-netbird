@@ -12,6 +12,7 @@ resource "netbird_account_settings" "example" {
   peer_approval_enabled                  = false
   network_traffic_logs_enabled           = false
   network_traffic_packet_counter_enabled = false
+  local_mfa_enabled                      = true
 
   # IPv6 overlay addressing
   network_range_v6    = "fd00:1234:5678::/64"

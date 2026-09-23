@@ -65,6 +65,7 @@ type AccountSettingsModel struct {
 	NetworkTrafficLogsGroups           types.List   `tfsdk:"network_traffic_logs_groups"`
 	PeerExposeEnabled                  types.Bool   `tfsdk:"peer_expose_enabled"`
 	PeerExposeGroups                   types.List   `tfsdk:"peer_expose_groups"`
+	LocalMfaEnabled                    types.Bool   `tfsdk:"local_mfa_enabled"`
 }
 
 func (r *AccountSettings) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -225,6 +226,12 @@ func (r *AccountSettings) Schema(ctx context.Context, req resource.SchemaRequest
 				Computed:            true,
 				PlanModifiers:       []planmodifier.List{listplanmodifier.UseStateForUnknown()},
 			},
+			"local_mfa_enabled": schema.BoolAttribute{
+				MarkdownDescription: "Enables or disables TOTP multi-factor authentication for local users. Only applicable when the embedded identity provider is enabled.",
+				Optional:            true,
+				Computed:            true,
+				PlanModifiers:       []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
+			},
 		},
 	}
 }
@@ -280,6 +287,7 @@ func accountAPIToTerraform(ctx context.Context, account *api.Account, data *Acco
 	data.PeerExposeEnabled = types.BoolValue(account.Settings.PeerExposeEnabled)
 	data.PeerExposeGroups, d = types.ListValueFrom(ctx, types.StringType, account.Settings.PeerExposeGroups)
 	ret.Append(d...)
+	data.LocalMfaEnabled = types.BoolPointerValue(account.Settings.LocalMfaEnabled)
 	return ret
 }
 
@@ -322,6 +330,7 @@ func accountTerraformToAPI(ctx context.Context, account *api.Account, data Accou
 	settings.LazyConnectionEnabled = boolDefaultPointer(data.LazyConnectionEnabled, settings.LazyConnectionEnabled)
 	settings.PeerExposeEnabled = boolDefault(data.PeerExposeEnabled, settings.PeerExposeEnabled)
 	settings.PeerExposeGroups = stringListDefault(ctx, data.PeerExposeGroups, settings.PeerExposeGroups)
+	settings.LocalMfaEnabled = boolDefaultPointer(data.LocalMfaEnabled, settings.LocalMfaEnabled)
 
 	return api.AccountRequest{Settings: settings}, diags
 }

@@ -247,8 +247,8 @@ resource "netbird_account_settings" "%s" {
 }`, gName, gName, rName, rangeV6, groups)
 }
 
-// Test_Account_UnmanagedSettingsSurviveUpdate covers settings that exist in the
-// API but not in the provider's schema. Management rebuilds the whole settings
+// Test_Account_UnmanagedSettingsSurviveUpdate covers settings the configuration
+// does not mention, whether or not the schema models them. Management rebuilds the whole settings
 // object from each PUT and resets any field the request leaves out, so a create
 // or an update that touches one modelled attribute must still send every other
 // setting back as the server holds it.
@@ -335,4 +335,54 @@ func testCheckAccountUnmanagedSettings(accountID string, want map[string]bool) r
 		}
 		return matchPairs(pairs)
 	}
+}
+
+// Test_Account_LocalMfa checks that local_mfa_enabled reaches management in both
+// directions. The harness runs the embedded IdP, the only one the setting affects.
+func Test_Account_LocalMfa(t *testing.T) {
+	env := testE2E(t)
+	ctx := context.Background()
+	client := testClient()
+
+	original := testAccountSettings(t, env.AccountID)
+	t.Cleanup(func() {
+		if _, err := client.Accounts.Update(ctx, env.AccountID, api.AccountRequest{Settings: original}); err != nil {
+			t.Errorf("restore account settings: %v", err)
+		}
+	})
+	initial := valOr(original.LocalMfaEnabled, false)
+
+	rName := "acc" + acctest.RandStringFromCharSet(10, acctest.CharSetAlphaNum)
+	rNameFull := "netbird_account_settings." + rName
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testEnsureManagementRunning(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccountResourceWithLocalMfa(rName, !initial),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "local_mfa_enabled", fmt.Sprint(!initial)),
+					testCheckAccountUnmanagedSettings(env.AccountID, map[string]bool{"local_mfa_enabled": !initial}),
+				),
+			},
+			{
+				Config: testAccountResourceWithLocalMfa(rName, initial),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "local_mfa_enabled", fmt.Sprint(initial)),
+					testCheckAccountUnmanagedSettings(env.AccountID, map[string]bool{"local_mfa_enabled": initial}),
+				),
+			},
+			{
+				ResourceName:      rNameFull,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func testAccountResourceWithLocalMfa(rName string, enabled bool) string {
+	return fmt.Sprintf(`resource "netbird_account_settings" "%s" {
+local_mfa_enabled = %v
+}`, rName, enabled)
 }

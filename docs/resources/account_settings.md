@@ -27,6 +27,7 @@ resource "netbird_account_settings" "example" {
   peer_approval_enabled                  = false
   network_traffic_logs_enabled           = false
   network_traffic_packet_counter_enabled = false
+  local_mfa_enabled                      = true
 
   # IPv6 overlay addressing
   network_range_v6    = "fd00:1234:5678::/64"
@@ -47,6 +48,7 @@ resource "netbird_account_settings" "example" {
 - `jwt_groups_claim_name` (String) Name of the claim from which we extract groups names to add it to account groups.
 - `jwt_groups_enabled` (Boolean) Allows extract groups from JWT claim and add it to account groups.
 - `lazy_connection_enabled` (Boolean) Enables or disables experimental lazy connection
+- `local_mfa_enabled` (Boolean) Enables or disables TOTP multi-factor authentication for local users. Only applicable when the embedded identity provider is enabled.
 - `network_range` (String) Allows to define a custom network range for the account in CIDR format
 - `network_range_v6` (String) IPv6 network range for the account in CIDR format (e.g. fd00:1234:5678::/64). Valid prefix lengths are /48 through /112.
 - `network_traffic_logs_enabled` (Boolean) Enables or disables network traffic logging. If enabled, all network traffic events from peers will be stored.
