@@ -246,6 +246,40 @@ func Test_Policy_Update_Resources(t *testing.T) {
 					},
 				),
 			},
+			{
+				ResourceName:      rNameFull,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				// An unrelated change to a resource-based rule. sources and
+				// destinations are not configured, so the update adopts them
+				// from state; next to the resources that has to be null, or the
+				// server rejects the PUT for carrying both.
+				Config: testPolicyResourceResources(rName, rName, "desc-updated", "accept", "udp", e2eResourceSubnetID(), "subnet", e2eResourceDomainID(), "domain", "1", "100"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectKnownValue(rNameFull, tfjsonpath.New("rule").AtSliceIndex(0).AtMapKey("sources"), knownvalue.Null()),
+						plancheck.ExpectKnownValue(rNameFull, tfjsonpath.New("rule").AtSliceIndex(0).AtMapKey("destinations"), knownvalue.Null()),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(rNameFull, "description", "desc-updated"),
+					resource.TestCheckResourceAttr(rNameFull, "rule.0.source_resource.id", e2eResourceSubnetID()),
+					resource.TestCheckResourceAttr(rNameFull, "rule.0.destination_resource.id", e2eResourceDomainID()),
+					func(s *terraform.State) error {
+						policy, err := testClient().Policies.Get(context.Background(), createdID)
+						if err != nil {
+							return err
+						}
+						return matchPairs(map[string][]any{
+							"Description":                     {"desc-updated", policy.Description},
+							"Rules[0].SourceResource.ID":      {e2eResourceSubnetID(), policy.Rules[0].SourceResource.Id},
+							"Rules[0].DestinationResource.ID": {e2eResourceDomainID(), policy.Rules[0].DestinationResource.Id},
+						})
+					},
+				),
+			},
 		},
 	})
 }

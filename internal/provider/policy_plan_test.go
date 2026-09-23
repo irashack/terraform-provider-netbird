@@ -6,6 +6,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/netbirdio/netbird/shared/management/http/api"
 )
 
 // The rule fields below are Optional+Computed. When the user leaves one out and
@@ -434,5 +435,55 @@ func Test_keepEmptyCollections(t *testing.T) {
 	}
 	if !data.Rules.Equal(ruleList(readRule)) {
 		t.Errorf("rules = %s, want the read value unchanged", data.Rules)
+	}
+}
+
+// A resource-based rule must not adopt a group list next to its resource: the
+// server rejects a PUT carrying both. The v0.79 handler writes "sources": null
+// for such a rule, but an empty array is handled too, because the mapping reads
+// an empty group list as null. This runs the API shapes through the read and
+// then an update that leaves every rule field unconfigured.
+func Test_adoptUnconfiguredRuleFields_resourceRuleFromAPI(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		name         string
+		sources      *[]api.GroupMinimum
+		destinations *[]api.GroupMinimum
+	}{
+		{"groups reported as null", nil, nil},
+		{"groups reported as empty arrays", &[]api.GroupMinimum{}, &[]api.GroupMinimum{}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var state PolicyModel
+			d := policyAPIToTerraform(ctx, &api.Policy{
+				Id:   valPtr("p1"),
+				Name: "p",
+				Rules: []api.PolicyRule{{
+					Id:                  valPtr("p1"),
+					Name:                "r",
+					Action:              api.PolicyRuleActionAccept,
+					Protocol:            api.PolicyRuleProtocolUdp,
+					Sources:             c.sources,
+					Destinations:        c.destinations,
+					SourceResource:      &api.Resource{Id: "r1", Type: api.ResourceTypeSubnet},
+					DestinationResource: &api.Resource{Id: "r2", Type: api.ResourceTypeDomain},
+				}},
+			}, &state)
+			if d.HasError() {
+				t.Fatalf("policyAPIToTerraform: %v", d)
+			}
+			var stateRules []PolicyRuleModel
+			if d := state.Rules.ElementsAs(ctx, &stateRules, false); d.HasError() {
+				t.Fatalf("rules: %v", d)
+			}
+
+			got := adoptUnconfiguredRuleFields(rulePlanned("udp"), ruleAllNull("udp"), stateRules[0])
+			if !got.Sources.IsNull() || !got.Destinations.IsNull() {
+				t.Errorf("sources = %s, destinations = %s; want both null next to a resource", got.Sources, got.Destinations)
+			}
+			if !got.SourceResource.Equal(ruleResource("r1", "subnet")) || !got.DestinationResource.Equal(ruleResource("r2", "domain")) {
+				t.Errorf("source_resource = %s, destination_resource = %s; want the prior resources", got.SourceResource, got.DestinationResource)
+			}
+		})
 	}
 }
