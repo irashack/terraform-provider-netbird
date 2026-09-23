@@ -995,13 +995,12 @@ func (keepUnconfiguredTargetFields) PlanModifyList(ctx context.Context, req plan
 
 	prior := req.StateValue.Elements()
 	planned := req.PlanValue.Elements()
-	plannedCount := countTargetKeys(planned)
+	matches, ambiguous := matchTargets(prior, planned)
 
 	changed := false
 	for i, e := range planned {
 		obj, ok := e.(types.Object)
-		key := targetKey(e)
-		if !ok || key == "" {
+		if !ok || targetKey(e) == "" {
 			continue
 		}
 		attrs := obj.Attributes()
@@ -1015,7 +1014,14 @@ func (keepUnconfiguredTargetFields) PlanModifyList(ctx context.Context, req plan
 			continue
 		}
 
-		match := matchPriorTarget(prior, e, plannedCount[key] > 1)
+		if ambiguous[i] {
+			resp.Diagnostics.AddAttributeError(req.Path.AtListIndex(i), "Ambiguous Target",
+				fmt.Sprintf("This target shares target_type and target_id (%s) with other targets and matches none of them by path, "+
+					"so the provider cannot tell which existing target it is and will not guess. Set host and options explicitly on this "+
+					"target (options = {} for none); otherwise the update would send none and the server would clear them.", targetKey(e)))
+			continue
+		}
+		match := matches[i]
 		if match < 0 {
 			continue
 		}
@@ -1040,6 +1046,54 @@ func (keepUnconfiguredTargetFields) PlanModifyList(ctx context.Context, req plan
 	list, d := types.ListValue(req.PlanValue.ElementType(ctx), planned)
 	resp.Diagnostics.Append(d...)
 	resp.PlanValue = list
+}
+
+// matchTargets pairs each current target with its prior target, returning the
+// prior index for each or -1. Targets are matched by matchPriorTarget first.
+// Of those left over, a resource with exactly one unmatched target on each side
+// pairs them: that is a shared target whose path changed. A current target
+// left unmatched while its resource still has unmatched prior targets is
+// reported as ambiguous.
+func matchTargets(prior, current []attr.Value) (matches []int, ambiguous []bool) {
+	matches = make([]int, len(current))
+	ambiguous = make([]bool, len(current))
+	used := make([]bool, len(prior))
+	counts := countTargetKeys(current)
+	for i, e := range current {
+		matches[i] = -1
+		j := matchPriorTarget(prior, e, counts[targetKey(e)] > 1)
+		if j >= 0 && !used[j] {
+			matches[i] = j
+			used[j] = true
+		}
+	}
+
+	unmatchedCurrent := map[string][]int{}
+	for i, e := range current {
+		if key := targetKey(e); key != "" && matches[i] < 0 {
+			unmatchedCurrent[key] = append(unmatchedCurrent[key], i)
+		}
+	}
+	unmatchedPrior := map[string][]int{}
+	for j, e := range prior {
+		if key := targetKey(e); key != "" && !used[j] {
+			unmatchedPrior[key] = append(unmatchedPrior[key], j)
+		}
+	}
+	for key, cur := range unmatchedCurrent {
+		left := unmatchedPrior[key]
+		switch {
+		case len(left) == 0:
+			// New targets: nothing to keep.
+		case len(cur) == 1 && len(left) == 1:
+			matches[cur[0]] = left[0]
+		default:
+			for _, i := range cur {
+				ambiguous[i] = true
+			}
+		}
+	}
+	return matches, ambiguous
 }
 
 // matchPriorTarget returns the index in prior of the same target as target, or
@@ -1210,13 +1264,13 @@ func reconcileTargets(ctx context.Context, prior, current types.List) (types.Lis
 
 	priorElems := prior.Elements()
 	out := current.Elements()
-	currentCount := countTargetKeys(out)
+	matches, _ := matchTargets(priorElems, out)
 	for i, e := range out {
 		cur, ok := e.(types.Object)
 		if !ok || cur.IsNull() || cur.IsUnknown() {
 			continue
 		}
-		j := matchPriorTarget(priorElems, e, currentCount[targetKey(e)] > 1)
+		j := matches[i]
 		if j < 0 {
 			continue
 		}

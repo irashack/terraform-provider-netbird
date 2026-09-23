@@ -1560,6 +1560,29 @@ func Test_ReverseProxyService_SharedTargetPaths(t *testing.T) {
 					serverTimeouts,
 				),
 			},
+			{
+				// One shared target moves to a new path with its options left
+				// out. It is the only unmatched target on that peer, so it is
+				// the /api target, and its options are kept rather than cleared.
+				Config: testReverseProxyServiceTargets(rName, domain, fmt.Sprintf(`{
+    target_id   = %q
+    target_type = "peer"
+    port        = 8080
+    protocol    = "http"
+    path        = "/v2"
+  }`, peerID), root),
+				Check: func(*terraform.State) error {
+					svc, err := testClient().ReverseProxyServices.Get(context.Background(), createdID)
+					if err != nil {
+						return fmt.Errorf("get service: %w", err)
+					}
+					tgt := svc.Targets[0]
+					return matchPairs(map[string][]any{
+						"Target.Path":           {"/v2", valOr(tgt.Path, "")},
+						"Target.RequestTimeout": {"2m0s", valOr(valOr(tgt.Options, api.ServiceTargetOptions{}).RequestTimeout, "")},
+					})
+				},
+			},
 		},
 	})
 }

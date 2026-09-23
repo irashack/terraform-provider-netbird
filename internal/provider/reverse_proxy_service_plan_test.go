@@ -209,6 +209,21 @@ func planUpdate(t *testing.T, prior, config ReverseProxyServiceModel) ReversePro
 	return out
 }
 
+func planResponse(t *testing.T, prior, config ReverseProxyServiceModel) (*tfprotov6.PlanResourceChangeResponse, tfsdk.State) {
+	t.Helper()
+	srv, empty := reverseProxyServiceProtocol(t)
+	resp, err := srv.PlanResourceChange(context.Background(), &tfprotov6.PlanResourceChangeRequest{
+		TypeName:         reverseProxyServiceType,
+		PriorState:       dynamicValue(t, empty, prior),
+		ProposedNewState: dynamicValue(t, empty, proposedNewState(t, config, prior)),
+		Config:           dynamicValue(t, empty, config),
+	})
+	if err != nil {
+		t.Fatalf("PlanResourceChange: %v", err)
+	}
+	return resp, empty
+}
+
 // planIsEmpty reports whether Terraform would plan no change: core compares the
 // planned state with the prior state.
 func planIsEmpty(t *testing.T, prior, config ReverseProxyServiceModel) bool {
@@ -233,17 +248,7 @@ func planIsEmpty(t *testing.T, prior, config ReverseProxyServiceModel) bool {
 func plan(t *testing.T, prior, config ReverseProxyServiceModel) (tftypes.Value, ReverseProxyServiceModel) {
 	t.Helper()
 	ctx := context.Background()
-	srv, empty := reverseProxyServiceProtocol(t)
-
-	resp, err := srv.PlanResourceChange(ctx, &tfprotov6.PlanResourceChangeRequest{
-		TypeName:         reverseProxyServiceType,
-		PriorState:       dynamicValue(t, empty, prior),
-		ProposedNewState: dynamicValue(t, empty, proposedNewState(t, config, prior)),
-		Config:           dynamicValue(t, empty, config),
-	})
-	if err != nil {
-		t.Fatalf("PlanResourceChange: %v", err)
-	}
+	resp, empty := planResponse(t, prior, config)
 	if errs := protocolErrors(resp.Diagnostics); len(errs) > 0 {
 		t.Fatalf("PlanResourceChange: %s", strings.Join(errs, "; "))
 	}
@@ -604,20 +609,6 @@ func Test_reverseProxyServicePlan_keepsUnconfiguredTargetHostAndPath(t *testing.
 			want: []hostPath{{nil, str("/new")}, {str("192.168.1.10"), str("/a")}},
 		},
 		{
-			// Without paths there is nothing to tell them apart by, so nothing
-			// is guessed. ValidateConfig rejects this configuration anyway.
-			name: "shared resource without paths",
-			prior: []ReverseProxyServiceTargetModel{
-				targetModel("res-a", "subnet", "192.168.1.10", "/a"),
-				targetModel("res-a", "subnet", "192.168.1.20", "/b"),
-			},
-			config: []ReverseProxyServiceTargetModel{
-				targetModel("res-a", "subnet", "", ""),
-				targetModel("res-a", "subnet", "", ""),
-			},
-			want: []hostPath{{nil, nil}, {nil, nil}},
-		},
-		{
 			name:  "new target",
 			prior: []ReverseProxyServiceTargetModel{targetModel("res-a", "subnet", "192.168.1.10", "/a")},
 			config: []ReverseProxyServiceTargetModel{
@@ -946,4 +937,76 @@ func Test_reverseProxyServicePlan_derivedAttributesFollowTheirSource(t *testing.
 		t.Errorf("unrelated update planned proxy_cluster %v, port_auto_assigned %v, listen_port %v; want the prior values",
 			planned.ProxyCluster, planned.PortAutoAssigned, planned.ListenPort)
 	}
+}
+
+// Targets sharing a resource are matched to prior state by path, so changing
+// one target's path loses its match. Where exactly one target of that resource
+// is left on each side, they are the same target; anything else is refused
+// rather than guessed, because a wrong match sends another target's host and
+// options, and no match sends none and the server clears them.
+func Test_reverseProxyServicePlan_sharedTargetPathChange(t *testing.T) {
+	timeout := func(v string) types.Object {
+		return optionsObject(t, map[string]attr.Value{"request_timeout": types.StringValue(v)})
+	}
+	base := stateFromAPI(t, privateServiceAPI())
+
+	t.Run("one path changed", func(t *testing.T) {
+		prior := withTargets(t, base,
+			withOptions(targetModel("res-a", "subnet", "192.168.1.10", "/a"), timeout("10s")),
+			withOptions(targetModel("res-a", "subnet", "192.168.1.20", "/b"), timeout("20s")),
+		)
+		config := withTargets(t, configFromState(base),
+			withOptions(targetModel("res-a", "subnet", "", "/a"), types.ObjectNull(ReverseProxyTargetOptionsModel{}.TFType().AttrTypes)),
+			withOptions(targetModel("res-a", "subnet", "", "/c"), types.ObjectNull(ReverseProxyTargetOptionsModel{}.TFType().AttrTypes)),
+		)
+
+		req := planUpdateRequest(t, prior, config)
+		got := (*req.Targets)[1]
+		if got.Host == nil || *got.Host != "192.168.1.20" {
+			t.Errorf("host = %v, want the /b target's 192.168.1.20", got.Host)
+		}
+		if got.Options == nil || got.Options.RequestTimeout == nil || *got.Options.RequestTimeout != "20s" {
+			t.Errorf("options = %+v, want the /b target's", got.Options)
+		}
+	})
+
+	t.Run("two paths changed", func(t *testing.T) {
+		prior := withTargets(t, base,
+			withOptions(targetModel("res-a", "subnet", "192.168.1.10", "/a"), timeout("10s")),
+			withOptions(targetModel("res-a", "subnet", "192.168.1.20", "/b"), timeout("20s")),
+			withOptions(targetModel("res-a", "subnet", "192.168.1.30", "/c"), timeout("30s")),
+		)
+		config := withTargets(t, configFromState(base),
+			withOptions(targetModel("res-a", "subnet", "", "/a"), types.ObjectNull(ReverseProxyTargetOptionsModel{}.TFType().AttrTypes)),
+			withOptions(targetModel("res-a", "subnet", "", "/x"), types.ObjectNull(ReverseProxyTargetOptionsModel{}.TFType().AttrTypes)),
+			withOptions(targetModel("res-a", "subnet", "", "/y"), types.ObjectNull(ReverseProxyTargetOptionsModel{}.TFType().AttrTypes)),
+		)
+
+		resp, _ := planResponse(t, prior, config)
+		errs := protocolErrors(resp.Diagnostics)
+		if len(errs) != 2 {
+			t.Fatalf("want an error for each of the two unmatched targets, got %v", errs)
+		}
+		for _, e := range errs {
+			if !strings.Contains(e, "host") || !strings.Contains(e, "options") {
+				t.Errorf("error does not say to set host and options: %s", e)
+			}
+		}
+	})
+
+	t.Run("configured explicitly", func(t *testing.T) {
+		prior := withTargets(t, base,
+			withOptions(targetModel("res-a", "subnet", "192.168.1.10", "/a"), timeout("10s")),
+			withOptions(targetModel("res-a", "subnet", "192.168.1.20", "/b"), timeout("20s")),
+			withOptions(targetModel("res-a", "subnet", "192.168.1.30", "/c"), timeout("30s")),
+		)
+		config := withTargets(t, configFromState(base),
+			withOptions(targetModel("res-a", "subnet", "192.168.1.10", "/a"), timeout("10s")),
+			withOptions(targetModel("res-a", "subnet", "192.168.1.40", "/x"), timeout("40s")),
+			withOptions(targetModel("res-a", "subnet", "192.168.1.50", "/y"), optionsObject(t, nil)),
+		)
+		if errs := protocolErrors(func() []*tfprotov6.Diagnostic { r, _ := planResponse(t, prior, config); return r.Diagnostics }()); len(errs) > 0 {
+			t.Fatalf("unexpected errors: %v", errs)
+		}
+	})
 }
